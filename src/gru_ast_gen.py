@@ -55,6 +55,9 @@ class PolicyOutput:
 class GRUPolicyNet(nn.Module):
     """Image-conditioned GRU policy for discrete Action selection.
 
+    The network can handle either a single image [B, C, H, W] or multiple views [B, V, C, H, W]
+    and will fuse view features by averaging.
+
     Parameters
     ----------
     num_actions : int
@@ -133,8 +136,9 @@ class GRUPolicyNet(nn.Module):
         Parameters
         ----------
         img : torch.Tensor
-            Batch of target images, shape [B, C, H, W]. H,W should match the
-            size passed at construction time (or be downsampled accordingly).
+            Batch of target images. Can be either [B, C, H, W] (single fused image)
+            or [B, V, C, H, W] (V views per example).
+            H,W should match the size passed at construction time.
         action_seq : torch.Tensor
             Integer tensor of shape [B, T] containing action IDs. These should
             correspond to the `Action` enum values (or a remapped contiguous
@@ -151,9 +155,23 @@ class GRUPolicyNet(nn.Module):
 
         # Image branch
         # -------------
-        x_img = self.img_conv(img)
-        x_img = x_img.view(x_img.size(0), -1)
-        x_img = F.relu(self.img_fc(x_img))  # [B, hidden_dim]
+        # Support either:
+        #   - img: [B, C, H, W]  (single image)
+        #   - img: [B, V, C, H, W]  (multi-view, V images per example)
+        if img.dim() == 5:
+            # img: [B, V, C, H, W]
+            B, V, C, H, W = img.shape
+            img_flat = img.view(B * V, C, H, W)
+            feats = self.img_conv(img_flat)          # [B*V, C', H', W']
+            feats = feats.view(feats.size(0), -1)    # [B*V, F]
+            feats = feats.view(B, V, -1)             # [B, V, F]
+            feats = feats.mean(dim=1)                # [B, F] fuse views by average
+        else:
+            # img: [B, C, H, W]
+            feats = self.img_conv(img)
+            feats = feats.view(feats.size(0), -1)    # [B, F]
+
+        x_img = F.relu(self.img_fc(feats))           # [B, hidden_dim]
 
         # Action sequence branch
         # ----------------------
