@@ -1,0 +1,5 @@
+array([
+  0.0, 0.0, 1.0,   # cx, cy, cz
+  0.5, 2.0, 0.0,   # p0, p1, p2  (here: radius=0.5, height=2.0 for ADD_CYLINDER)
+  0.0, 90.0, 0.0,  # rx, ry, rz (deg)
+], dtype=float32)

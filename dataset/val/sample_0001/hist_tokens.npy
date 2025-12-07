@@ -1,0 +1,5 @@
+array([
+  0,  # ADD_BOX
+  3,  # MAKE_LAST_NEGATIVE
+  1,  # ADD_SPHERE
+], dtype=int64)
