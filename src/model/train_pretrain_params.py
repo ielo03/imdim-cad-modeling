@@ -1,9 +1,9 @@
 """Parameter pretraining script for the CAD model.
 
 This script trains the PointNet encoder + Transformer + ParamHead stack
-purely on a mean-squared-error loss over the 9D parameter vectors:
+purely on a mean-squared-error loss over the 10D parameter vectors:
 
-    params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz]
+    params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
 
 There is deliberately:
     - NO token auxiliary loss
@@ -18,7 +18,7 @@ You must provide a dataset that yields:
     {
         "gt_points": FloatTensor[B, N, 3],
         "gt_tokens": LongTensor[B, T],
-        "gt_params": FloatTensor[B, T, 9],
+        "gt_params": FloatTensor[B, T, 10],
     }
 
 By default, this file includes a tiny DummyCADDataset for smoke testing.
@@ -89,8 +89,8 @@ class DummyCADDataset(Dataset):
             tokens.append(random.choice(self._all_token_ids))
         gt_tokens = torch.tensor(tokens, dtype=torch.long)
 
-        # Random GT params per step: [T, 9]
-        gt_params = torch.randn(self.seq_len, 9)
+        # Random GT params per step: [T, 10]
+        gt_params = torch.randn(self.seq_len, 10)
 
         return {
             "gt_points": gt_points,
@@ -129,9 +129,9 @@ def compute_param_mse_loss(
 
     Parameters
     ----------
-    params_pred : FloatTensor [B, T, 9]
+    params_pred : FloatTensor [B, T, 10]
         Predicted parameter vectors.
-    gt_params : FloatTensor [B, T, 9]
+    gt_params : FloatTensor [B, T, 10]
         Ground-truth parameter vectors.
     tokens : LongTensor [B, T]
         Token ids per step.
@@ -150,8 +150,8 @@ def compute_param_mse_loss(
         )
 
     B, T, D = params_pred.shape
-    if D != 9:
-        raise ValueError(f"Expected last dim=9, got {D}")
+    if D != 10:
+        raise ValueError(f"Expected last dim=10, got {D}")
 
     # Mask to primitive-adding tokens only
     primitive_ids = torch.tensor(
@@ -172,8 +172,8 @@ def compute_param_mse_loss(
         return torch.zeros((), device=params_pred.device, dtype=params_pred.dtype)
 
     # Select only primitive steps
-    pred_prim = params_pred[primitive_mask]  # [K, 9]
-    gt_prim = gt_params[primitive_mask]      # [K, 9]
+    pred_prim = params_pred[primitive_mask]  # [K, 10]
+    gt_prim = gt_params[primitive_mask]      # [K, 10]
 
     loss = nn.functional.mse_loss(pred_prim, gt_prim)
     return loss
@@ -198,7 +198,7 @@ def train_epoch(
     for batch in dataloader:
         gt_points = batch["gt_points"].to(device)   # [B, N, 3]
         gt_tokens = batch["gt_tokens"].to(device)   # [B, T]
-        gt_params = batch["gt_params"].to(device)   # [B, T, 9]
+        gt_params = batch["gt_params"].to(device)   # [B, T, 10]
 
         params_pred, hidden_states, token_logits = forward_params_only(components, gt_points, gt_tokens)
 

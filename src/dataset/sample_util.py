@@ -6,6 +6,26 @@ This script generates a single sample directory under a specified root.
 Each sample consists of:
   - dsl.npz  (hist_tokens, hist_params, next_tokens, next_params)
 
+Conventions:
+
+  - Token IDs must match the Token enum in `state_machine.py`:
+
+        ADD_BOX      = 0
+        ADD_SPHERE   = 1
+        ADD_CYLINDER = 2
+        UNDO_LAST    = 3
+        END          = 4
+
+  - Parameter vectors are 10D:
+
+        [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
+
+    where:
+      * (cx, cy, cz) is the primitive center,
+      * (p0, p1, p2) are size/shape params (interpreted per primitive),
+      * (rx, ry, rz) are rotation angles,
+      * sign_raw < 0.5 → NEGATIVE, sign_raw >= 0.5 → POSITIVE.
+
 Usage (example):
     python -m dataset.sample_util --out-dir dataset/train --idx 0
 
@@ -16,40 +36,54 @@ import argparse
 from pathlib import Path
 import numpy as np
 
-# Token IDs must match Token enum in state_machine
-# (simplified here; adjust as needed)
+# Token IDs must match Token enum in state_machine.py
 ADD_BOX = 0
 ADD_SPHERE = 1
 ADD_CYLINDER = 2
-MAKE_LAST_NEGATIVE = 3
+UNDO_LAST = 3
+END = 4
+
 
 def make_synthetic_sample():
     """Return a synthetic sample: (hist_tokens, hist_params, next_tokens, next_params).
 
-    hist_tokens: [T_hist]
-    hist_params: [T_hist, 9]
-    next_tokens: [K]
-    next_params: [K, 9]
+    Shapes:
+        hist_tokens: [T_hist]
+        hist_params: [T_hist, 10]
+        next_tokens: [K]
+        next_params: [K, 10]
 
-    Modify this as needed to generate random or more complex samples.
+    This example:
+      - History: positive box + positive sphere
+      - Next:    negative cylinder cutout
     """
-    # Example: history of two primitives
+    # History tokens: add a box, then a sphere (both positive)
     hist_tokens = np.array([ADD_BOX, ADD_SPHERE], dtype=np.int64)
 
-    # params: [cx,cy,cz,  p0,p1,p2,  rx,ry,rz]
-    # For box, p0..p2 = size
-    hist_params = np.array([
-        [0.0, 0.0, 0.0,   2.0, 2.0, 2.0,   0.0, 0.0, 0.0],
-        [0.5, 0.5, 0.5,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0],  # sphere: p0=radius
-    ], dtype=np.float32)
+    # params: [cx,cy,cz,  p0,p1,p2,  rx,ry,rz,  sign_raw]
+    # Box: p0..p2 = size (sx, sy, sz)
+    # Sphere: p0 = radius, p1/p2 unused (0), rotation left at 0
+    hist_params = np.array(
+        [
+            # ADD_BOX: positive
+            [0.0, 0.0, 0.0,   2.0, 2.0, 2.0,   0.0, 0.0, 0.0,   1.0],
+            # ADD_SPHERE: positive
+            [0.5, 0.5, 0.5,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0,   1.0],
+        ],
+        dtype=np.float32,
+    )
 
-    # Next action: add cylinder and then make negative
-    next_tokens = np.array([ADD_CYLINDER, MAKE_LAST_NEGATIVE], dtype=np.int64)
+    # Next action: add a NEGATIVE cylinder as a cutout
+    next_tokens = np.array([ADD_CYLINDER], dtype=np.int64)
 
-    next_params = np.array([
-        [0.5, 0.0, 0.5,   0.5, 2.0, 0.0,   0.0, 45.0, 0.0],  # cylinder
-        [0.0, 0.0, 0.0,   0.0, 0.0, 0.0,   0.0, 0.0, 0.0],    # make negative
-    ], dtype=np.float32)
+    next_params = np.array(
+        [
+            # ADD_CYLINDER: negative (sign_raw = 0.0)
+            # cylinder: center (0.5, 0.0, 0.5), radius=0.5 (p0), height=2.0 (p1)
+            [0.5, 0.0, 0.5,   0.5, 2.0, 0.0,   0.0, 45.0, 0.0,   0.0],
+        ],
+        dtype=np.float32,
+    )
 
     return hist_tokens, hist_params, next_tokens, next_params
 

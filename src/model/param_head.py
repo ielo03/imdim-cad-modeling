@@ -17,6 +17,10 @@ We embed `token_t`, concatenate everything, and pass through an MLP to
 produce a fixed-size parameter vector. The caller interprets the output
 according to the token type (e.g., first 3 dims = center, next 3 = size
 for a box, etc.).
+
+A typical use case in this project is out_dim=10, where:
+    - First 9 components are geometry parameters,
+    - 10th component is a sign scalar used for positive/negative role.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ class ParamHead(nn.Module):
     out_dim : int
         Dimensionality of the parameter vector output. The caller is
         responsible for interpreting slices of this vector per token type.
+        In this project, out_dim is often 10 (9 geom + 1 sign), but is configurable.
     hidden_dim : int
         Hidden size for the MLP.
     err_dim : int
@@ -171,7 +176,7 @@ if __name__ == "__main__":  # pragma: no cover - simple smoke test
     err_dim = 0
 
     head = ParamHead(d_model=d_model, gt_dim=gt_dim, vocab_size=vocab_size,
-                     tok_emb_dim=32, out_dim=6, hidden_dim=128, err_dim=err_dim)
+                     tok_emb_dim=32, out_dim=10, hidden_dim=128, err_dim=err_dim)
 
     h_t = torch.randn(B, d_model)
     gt_embed = torch.randn(B, gt_dim)

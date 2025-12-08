@@ -8,16 +8,17 @@ This implements the semantics described in design.md:
         ADD_BOX
         ADD_SPHERE
         ADD_CYLINDER
-        MAKE_LAST_NEGATIVE
         UNDO_LAST
         END
   - Each decoding step from the model yields:
         (token, params)
     where `params` is a flat float vector interpreted according to the token.
 
-    - Primitive params always include center + size/radius/height + rotation:
+    - Each step uses a 10D parameter vector:
+        [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
         * center:   (cx, cy, cz)
         * rotation: (rx, ry, rz) in degrees, applied about the primitive center
+        * sign_raw: scalar in [0,1]; if < 0.5, primitive is negative, else positive
 
   - Evaluation rule (at a higher level):
         shape = empty
@@ -55,13 +56,11 @@ class Token(IntEnum):
 
     These should line up with whatever the transformer policy outputs.
     """
-
     ADD_BOX = 0
     ADD_SPHERE = 1
     ADD_CYLINDER = 2
-    MAKE_LAST_NEGATIVE = 3
-    UNDO_LAST = 4
-    END = 5
+    UNDO_LAST = 3
+    END = 4
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +111,9 @@ class ShapeState:
 
         Param layout (by convention; keep in sync with model):
 
-            The model always emits a fixed-length vector of 9 floats:
+            The model always emits a fixed-length vector of 10 floats:
 
-                params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz]
+                params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
 
             where:
                 - (cx, cy, cz) is the primitive center
@@ -131,6 +130,8 @@ class ShapeState:
                     ADD_CYLINDER:
                         radius = r = p0
                         height = h = p1 (p2 is ignored)
+
+                - sign_raw is a scalar in [0,1]; if sign_raw < 0.5, the primitive is negative, else positive.
 
             `ShapeState.apply` is responsible for mapping this unified vector
             into the token-specific parameter dicts stored on each Primitive.
@@ -152,8 +153,6 @@ class ShapeState:
             self._add_sphere(params)
         elif token == Token.ADD_CYLINDER:
             self._add_cylinder(params)
-        elif token == Token.MAKE_LAST_NEGATIVE:
-            self._make_last_negative()
         elif token == Token.UNDO_LAST:
             self._undo_last()
         elif token == Token.END:
@@ -177,12 +176,13 @@ class ShapeState:
         return params
 
     def _add_box(self, params: Optional[Sequence[float]]) -> None:
-        p = self._require_params(Token.ADD_BOX, params, expected_len=9)
-        cx, cy, cz, p0, p1, p2, rx, ry, rz = p[:9]
+        p = self._require_params(Token.ADD_BOX, params, expected_len=10)
+        cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         sx, sy, sz = p0, p1, p2
+        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
         prim = Primitive(
             kind="box",
-            role=Role.POSITIVE,
+            role=role,
             params={
                 "center": [float(cx), float(cy), float(cz)],
                 "size": [float(sx), float(sy), float(sz)],
@@ -192,12 +192,13 @@ class ShapeState:
         self.primitives.append(prim)
 
     def _add_sphere(self, params: Optional[Sequence[float]]) -> None:
-        p = self._require_params(Token.ADD_SPHERE, params, expected_len=9)
-        cx, cy, cz, p0, p1, p2, rx, ry, rz = p[:9]
+        p = self._require_params(Token.ADD_SPHERE, params, expected_len=10)
+        cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         r = p0
+        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
         prim = Primitive(
             kind="sphere",
-            role=Role.POSITIVE,
+            role=role,
             params={
                 "center": [float(cx), float(cy), float(cz)],
                 "radius": float(r),
@@ -207,12 +208,13 @@ class ShapeState:
         self.primitives.append(prim)
 
     def _add_cylinder(self, params: Optional[Sequence[float]]) -> None:
-        p = self._require_params(Token.ADD_CYLINDER, params, expected_len=9)
-        cx, cy, cz, p0, p1, p2, rx, ry, rz = p[:9]
+        p = self._require_params(Token.ADD_CYLINDER, params, expected_len=10)
+        cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         r, h = p0, p1
+        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
         prim = Primitive(
             kind="cylinder",
-            role=Role.POSITIVE,
+            role=role,
             params={
                 "center": [float(cx), float(cy), float(cz)],
                 "radius": float(r),
@@ -227,12 +229,6 @@ class ShapeState:
     # Non-primitive token helpers
     # ------------------------------------------------------------------
 
-    def _make_last_negative(self) -> None:
-        if not self.primitives:
-            # Should typically be masked by the environment / policy.
-            # We still guard here to avoid crashes.
-            return
-        self.primitives[-1].role = Role.NEGATIVE
 
     def _undo_last(self) -> None:
         if not self.primitives:
@@ -268,11 +264,10 @@ class ShapeState:
 
 
 if __name__ == "__main__":  # pragma: no cover - manual sanity check
-    # Example: build a simple shape with a box and a subtractive sphere.
+    # Example: build a simple shape with a positive box and a negative sphere.
     s = ShapeState()
-    s.apply(Token.ADD_BOX, [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0])
-    s.apply(Token.ADD_SPHERE, [0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    s.apply(Token.MAKE_LAST_NEGATIVE)
+    s.apply(Token.ADD_BOX, [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 1.0])   # positive box (sign_raw=1.0)
+    s.apply(Token.ADD_SPHERE, [0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # negative sphere (sign_raw=0.0)
     s.apply(Token.END)
     import json
 

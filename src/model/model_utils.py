@@ -10,12 +10,12 @@ The goals are:
     - Provide a clean way to run a forward pass for param pretraining.
     - Provide a helper to apply a single model step to a ShapeState.
 
-The core convention for parameters is a fixed 9D vector:
+The core convention for parameters is a fixed 10D vector:
 
-    params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz]
+    params_vec = [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
 
 `ShapeState.apply` is responsible for interpreting (p0, p1, p2)
-according to the current token.
+according to the current token. The 10th entry, sign_raw, is used to decide the primitive sign.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class ModelComponents:
     transformer : CADTransformer
         Autoregressive backbone over DSL tokens.
     param_head : ParamHead
-        Predicts the 9D parameter vector at each step.
+        Predicts the 10D parameter vector at each step (9 geom + sign).
     """
 
     pointnet: PointNetEncoder
@@ -134,7 +134,7 @@ def build_cad_model(
         gt_dim=gt_dim,
         vocab_size=vocab_size,
         tok_emb_dim=tok_emb_dim or d_model,
-        out_dim=9,           # [cx, cy, cz, p0, p1, p2, rx, ry, rz]
+        out_dim=10,           # [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
         hidden_dim=hidden_dim,
         err_dim=err_dim,
     )
@@ -169,7 +169,7 @@ def forward_params_only(
 
     Returns
     -------
-    params_pred : FloatTensor [B, T, 9]
+    params_pred : FloatTensor [B, T, 10]
         Predicted parameter vectors per step.
     hidden_states : FloatTensor [B, T, d_model]
         Transformer hidden states.
@@ -198,10 +198,10 @@ def forward_params_only(
     for t in range(T):
         h_t = hidden_states[:, t, :]        # [B, d_model]
         tok_t = tokens[:, t]               # [B]
-        params_t = param_head(h_t, gt_embed, tok_t)  # [B, 9]
+        params_t = param_head(h_t, gt_embed, tok_t)  # [B, 10]
         params_list.append(params_t.unsqueeze(1))
 
-    params_pred = torch.cat(params_list, dim=1)  # [B, T, 9]
+    params_pred = torch.cat(params_list, dim=1)  # [B, T, 10]
     return params_pred, hidden_states, token_logits
 
 
@@ -218,10 +218,10 @@ def apply_model_step(
         The mutable program state.
     token_id : int or Token
         DSL token to apply. If an int is provided, it is cast to `Token`.
-    params_vec : Tensor or sequence of length 9
+    params_vec : Tensor or sequence of length 10
         Predicted parameter vector for this step; interpreted as
-        [cx, cy, cz, p0, p1, p2, rx, ry, rz]. `ShapeState.apply` will
-        handle the token-specific interpretation of p0/p1/p2.
+        [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]. `ShapeState.apply` will
+        handle the token-specific interpretation of p0/p1/p2 and sign_raw.
     """
 
     if isinstance(token_id, int):
@@ -232,15 +232,15 @@ def apply_model_step(
     if isinstance(params_vec, torch.Tensor):
         if params_vec.ndim == 2 and params_vec.shape[0] == 1:
             params_vec = params_vec[0]
-        if params_vec.ndim != 1 or params_vec.shape[0] != 9:
+        if params_vec.ndim != 1 or params_vec.shape[0] != 10:
             raise ValueError(
-                f"params_vec tensor must have shape [9] or [1,9], got {tuple(params_vec.shape)}"
+                f"params_vec tensor must have shape [10] or [1,10], got {tuple(params_vec.shape)}"
             )
         params = params_vec.detach().cpu().tolist()
     else:
         params = list(params_vec)
-        if len(params) != 9:
-            raise ValueError(f"params_vec sequence must have length 9, got {len(params)}")
+        if len(params) != 10:
+            raise ValueError(f"params_vec sequence must have length 10, got {len(params)}")
 
     state.apply(token, params)
 
