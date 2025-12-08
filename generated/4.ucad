@@ -1,0 +1,17 @@
+use std::geo3d::*;
+use std::ops::*;
+
+XnoPasPRgw = Cylinder(d = 11.268167mm, h = 7.957306mm)
+;
+UfUbwnPQFX = Cube(size_x = 14.942149mm, size_y = 9.917736mm, size_z = 16.314194mm)
+;
+yQXUsnxDqe = Cube(size_x = 3.270134mm, size_y = 10.341148mm, size_z = 17.282726mm)
+	.rotate(x = 157.93997deg, y = 128.00029deg, z = 169.8309deg)
+;
+OgeVmjjWgf = Cube(size_x = 4.996653mm, size_y = 14.371968mm, size_z = 3.3131819mm)
+	.translate(x = 8.314993mm, y = 1.7585421mm, z = 9.107007mm)
+	.rotate(x = 149.25034deg, y = 63.48896deg, z = 255.51225deg)
+;
+IDbGSaCgeN = Cylinder(d = 9.649098mm, h = 6.0570674mm)
+;
+XnoPasPRgw - UfUbwnPQFX - yQXUsnxDqe - OgeVmjjWgf | IDbGSaCgeN;

@@ -1,0 +1,21 @@
+use std::geo3d::*;
+use std::ops::*;
+
+iieqtxgFnR = Cylinder(d = 4.7333565mm, h = 14.309236mm)
+;
+zqIrupQMaE = Cube(size_x = 19.975449mm, size_y = 2.481419mm, size_z = 14.965695mm)
+;
+IaloOjLYNG = Cube(size_x = 5.1217136mm, size_y = 16.59114mm, size_z = 18.497217mm)
+;
+XhlijKQBqT = Cube(size_x = 5.6416163mm, size_y = 3.26263mm, size_z = 6.8284597mm)
+	.translate(x = 1.3366914mm, y = 3.635683mm, z = 4.682454mm)
+;
+QsCztZpEFX = Cube(size_x = 14.851939mm, size_y = 11.7866535mm, size_z = 3.4260683mm)
+	.translate(x = 2.1710944mm, y = 4.704567mm, z = 1.13101mm)
+;
+BtSUwOlGfh = Cube(size_x = 7.776515mm, size_y = 18.642487mm, size_z = 10.754717mm)
+;
+jBUkeTmMKK = Cylinder(d = 19.017836mm, h = 19.250359mm)
+	.rotate(x = 244.14003deg, y = 87.497696deg, z = 141.42477deg)
+;
+iieqtxgFnR | zqIrupQMaE | IaloOjLYNG - XhlijKQBqT | QsCztZpEFX - BtSUwOlGfh | jBUkeTmMKK;

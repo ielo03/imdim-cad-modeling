@@ -1,0 +1,11 @@
+use std::geo3d::*;
+use std::ops::*;
+
+BKFlpcbNFe = Cube(size_x = 3.7392354mm, size_y = 13.984732mm, size_z = 5.1688747mm)
+	.rotate(x = 327.87152deg, y = 80.09921deg, z = 271.5259deg)
+;
+ixzOWJZfOi = Cube(size_x = 11.95524mm, size_y = 13.526094mm, size_z = 10.227897mm)
+	.translate(x = 4.9055624mm, y = 7.085265mm, z = 8.182921mm)
+	.rotate(x = 124.38747deg, y = 335.67645deg, z = 264.4143deg)
+;
+BKFlpcbNFe - ixzOWJZfOi;

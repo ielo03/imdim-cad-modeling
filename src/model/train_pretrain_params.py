@@ -1,4 +1,4 @@
-"""Parameter pretraining script for the CAD model.
+r"""Parameter pretraining script for the CAD model.
 
 This script trains the PointNet encoder + Transformer + ParamHead stack
 purely on a mean-squared-error loss over the 10D parameter vectors:
@@ -33,6 +33,7 @@ import argparse
 import random
 from typing import Dict, Any
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -51,51 +52,87 @@ from model.model_utils import build_cad_model, forward_params_only
 
 
 # ---------------------------------------------------------------------------
-# Dummy dataset (replace with real one)
+# NPZ dataset (replace DummyCADDataset)
 # ---------------------------------------------------------------------------
 
 
-class DummyCADDataset(Dataset):
-    """Tiny random dataset for smoke testing the training loop.
+class NPZCADDataset(Dataset):
+    """Dataset that reads CAD samples from sample.npz files.
 
-    This is NOT meant for real training. It just ensures the plumbing
-    works end-to-end before you plug in your real dataset.
+    Each sample.npz must contain:
+        gt_mesh     : [N, 3] float16 or float32 (GT point cloud)
+        cur_mesh    : [M, 3] float16 or float32 (current state point cloud)
+        hist_params : [H, 10]
+        hist_tokens : [H]
+        next_params : [K, 10]
+        next_tokens : [K]
+
+    We return:
+        gt_points : [N, 3] float32
+        cur_points: [M, 3] float32 (not yet used in training loop, but required)
+        gt_tokens : [T]    long, where T = H + K
+        gt_params : [T,10] float32, matching gt_tokens
     """
 
-    def __init__(self, num_samples: int = 32, num_points: int = 128, seq_len: int = 6):
+    def __init__(self, root_dir: str):
         super().__init__()
-        self.num_samples = num_samples
-        self.num_points = num_points
-        self.seq_len = seq_len
+        self.root = Path(root_dir)
 
-        self._primitive_token_ids = [
-            Token.ADD_BOX.value,
-            Token.ADD_SPHERE.value,
-            Token.ADD_CYLINDER.value,
-        ]
+        # Either a single root/sample.npz, or many root/sample_XXXXX.npz
+        single_path = self.root / "sample.npz"
+        if single_path.exists():
+            self.sample_paths = [single_path]
+        else:
+            # New flat layout: dataset/train/sample_XXXXX.npz, dataset/val/sample_XXXXX.npz
+            self.sample_paths = sorted(self.root.glob("sample_*.npz"))
 
-        self._all_token_ids = [t.value for t in Token]
+        if not self.sample_paths:
+            raise RuntimeError(f"No sample.npz or sample_*.npz files found under {self.root}")
 
     def __len__(self) -> int:
-        return self.num_samples
+        return len(self.sample_paths)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:  # type: ignore
-        # Random GT point cloud
-        gt_points = torch.randn(self.num_points, 3)
+        path = self.sample_paths[idx]
+        data = np.load(path)
 
-        # Random token sequence (mix of primitives + others)
-        tokens = []
-        for _ in range(self.seq_len):
-            tokens.append(random.choice(self._all_token_ids))
-        gt_tokens = torch.tensor(tokens, dtype=torch.long)
+        # --- GT point cloud ---
+        gt_mesh = data["gt_mesh"].astype(np.float32)  # [N,3]
+        if gt_mesh.ndim != 2 or gt_mesh.shape[1] != 3:
+            raise ValueError(f"gt_mesh must be [N,3], got {gt_mesh.shape}")
+        gt_points = torch.from_numpy(gt_mesh)  # [N,3]
 
-        # Random GT params per step: [T, 10]
-        gt_params = torch.randn(self.seq_len, 10)
+        # --- current-state point cloud (required, even if not yet used) ---
+        cur_mesh = data["cur_mesh"].astype(np.float32)  # [M,3]
+        if cur_mesh.ndim != 2 or cur_mesh.shape[1] != 3:
+            raise ValueError(f"cur_mesh must be [M,3], got {cur_mesh.shape}")
+        cur_points = torch.from_numpy(cur_mesh)  # [M,3]
+
+        # --- history & next ---
+        hist_params = data["hist_params"].astype(np.float32)  # [H,10] or [0,10]
+        hist_tokens = data["hist_tokens"].astype(np.int64)    # [H]
+
+        next_params = data["next_params"].astype(np.float32)  # [K,10] or [1,10]
+        next_tokens = data["next_tokens"].astype(np.int64)    # [K]
+
+        # Safety reshapes for empty or 1D cases
+        if hist_params.ndim == 1:
+            hist_params = hist_params.reshape(-1, 10)
+        if next_params.ndim == 1:
+            next_params = next_params.reshape(-1, 10)
+
+        # concat history + next into full program
+        gt_tokens = np.concatenate([hist_tokens, next_tokens], axis=0)      # [T]
+        gt_params = np.concatenate([hist_params, next_params], axis=0)      # [T,10]
+
+        gt_tokens_t = torch.from_numpy(gt_tokens).long()   # [T]
+        gt_params_t = torch.from_numpy(gt_params).float()  # [T,10]
 
         return {
-            "gt_points": gt_points,
-            "gt_tokens": gt_tokens,
-            "gt_params": gt_params,
+            "gt_points": gt_points,      # [N,3]
+            "cur_points": cur_points,    # [M,3]
+            "gt_tokens": gt_tokens_t,    # [T]
+            "gt_params": gt_params_t,    # [T,10]
         }
 
 
@@ -106,17 +143,15 @@ class DummyCADDataset(Dataset):
 
 def build_dataloader(
     batch_size: int,
-    num_samples: int = 128,
-    num_points: int = 256,
-    seq_len: int = 8,
+    data_root: str,
 ) -> DataLoader:
-    """Build a DataLoader.
+    """Build a DataLoader over NPZCADDataset.
 
-    For now, this uses DummyCADDataset. Replace with your real Dataset
-    when it's ready.
+    Note: if samples have varying N/T, use batch_size=1 or add a custom
+    collate_fn to pad sequences.
     """
 
-    dataset = DummyCADDataset(num_samples=num_samples, num_points=num_points, seq_len=seq_len)
+    dataset = NPZCADDataset(data_root)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
 
@@ -197,6 +232,7 @@ def train_epoch(
 
     for batch in dataloader:
         gt_points = batch["gt_points"].to(device)   # [B, N, 3]
+        cur_points = batch["cur_points"].to(device) # [B, M, 3] (unused for now)
         gt_tokens = batch["gt_tokens"].to(device)   # [B, T]
         gt_params = batch["gt_params"].to(device)   # [B, T, 10]
 
@@ -224,12 +260,11 @@ def train_epoch(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Param pretraining for CAD model")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size (use 1 if variable lengths)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_samples", type=int, default=128, help="Number of dummy samples")
-    parser.add_argument("--num_points", type=int, default=256, help="Points per GT shape")
-    parser.add_argument("--seq_len", type=int, default=8, help="Token sequence length")
+    parser.add_argument("--data_root", type=str, required=True, help="Root directory with sample.npz files")
+    parser.add_argument("--max_seq_len", type=int, default=32, help="Maximum token sequence length for the transformer")
     return parser.parse_args()
 
 
@@ -245,7 +280,7 @@ def main() -> None:
         d_model=256,
         n_heads=4,
         num_layers=4,
-        max_seq_len=args.seq_len,
+        max_seq_len=args.max_seq_len,
         hidden_dim=256,
         err_dim=0,
         device=device,
@@ -260,9 +295,7 @@ def main() -> None:
 
     dataloader = build_dataloader(
         batch_size=args.batch_size,
-        num_samples=args.num_samples,
-        num_points=args.num_points,
-        seq_len=args.seq_len,
+        data_root=args.data_root,
     )
 
     for epoch in range(1, args.epochs + 1):

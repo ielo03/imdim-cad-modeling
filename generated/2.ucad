@@ -1,0 +1,22 @@
+use std::geo3d::*;
+use std::ops::*;
+
+HssAQaunmX = Cube(size_x = 10.881445mm, size_y = 1.5153388mm, size_z = 3.3629458mm)
+	.translate(x = 0.3520882mm, y = 2.8849542mm, z = 6.1677527mm)
+	.rotate(x = 321.7097deg, y = 261.4514deg, z = 267.42856deg)
+;
+zBofiitwxk = Sphere(16.423666mm)
+	.rotate(x = 137.14958deg, y = 220.45677deg, z = 84.19917deg)
+;
+fQRnjadcHa = Cube(size_x = 5.084493mm, size_y = 18.938618mm, size_z = 17.893782mm)
+	.translate(x = 2.2243655mm, y = 2.6461053mm, z = 3.6204123mm)
+;
+CZwduDDJcJ = Cylinder(d = 5.405352mm, h = 3.4510126mm)
+	.translate(x = 6.145053mm, y = 4.3833647mm, z = 6.437776mm)
+;
+tyNpzZaxIk = Cylinder(d = 19.53274mm, h = 2.9227772mm)
+	.translate(x = 5.6241703mm, y = 6.8393135mm, z = 3.361063mm)
+;
+OzfBQuLzMt = Cylinder(d = 4.1439934mm, h = 2.9723234mm)
+;
+HssAQaunmX - zBofiitwxk | fQRnjadcHa - CZwduDDJcJ | tyNpzZaxIk | OzfBQuLzMt;

@@ -1,0 +1,16 @@
+use std::geo3d::*;
+use std::ops::*;
+
+dGIOtBYiFv = Sphere(15.192198mm)
+	.translate(x = 2.9590297mm, y = 3.8178742mm, z = 8.951153mm)
+;
+zbOvehKlYK = Sphere(3.5533285mm)
+	.rotate(x = 205.95052deg, y = 92.56158deg, z = 107.24515deg)
+;
+vkTVEUgnnI = Sphere(11.239943mm)
+	.translate(x = 5.8576574mm, y = 1.2648702mm, z = 4.22295mm)
+;
+HTUgqxJLbz = Cylinder(d = 7.062651mm, h = 3.3479018mm)
+	.rotate(x = 255.49045deg, y = 358.34796deg, z = 260.83664deg)
+;
+dGIOtBYiFv | zbOvehKlYK - vkTVEUgnnI - HTUgqxJLbz;

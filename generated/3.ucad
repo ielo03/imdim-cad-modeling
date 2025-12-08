@@ -1,0 +1,19 @@
+use std::geo3d::*;
+use std::ops::*;
+
+lpymTrxPXc = Cube(size_x = 18.079102mm, size_y = 19.383224mm, size_z = 10.077419mm)
+;
+FkOzxvndxG = Cube(size_x = 12.942954mm, size_y = 13.020703mm, size_z = 7.149212mm)
+	.translate(x = 4.703071mm, y = 9.863966mm, z = 0.89960337mm)
+	.rotate(x = 321.98236deg, y = 67.73269deg, z = 176.01497deg)
+;
+kGmRpJtSKO = Sphere(3.6928058mm)
+;
+LflajtFmSv = Cylinder(d = 4.364582mm, h = 17.876143mm)
+	.rotate(x = 58.73085deg, y = 350.48923deg, z = 233.98438deg)
+;
+YUAuMTMJIa = Cube(size_x = 19.631042mm, size_y = 8.637313mm, size_z = 2.5266147mm)
+	.translate(x = 1.6424215mm, y = 8.00713mm, z = 8.446522mm)
+	.rotate(x = 274.4665deg, y = 255.4429deg, z = 89.184654deg)
+;
+lpymTrxPXc | FkOzxvndxG - kGmRpJtSKO | LflajtFmSv - YUAuMTMJIa;

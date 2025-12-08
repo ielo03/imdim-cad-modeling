@@ -1,0 +1,9 @@
+use std::geo3d::*;
+use std::ops::*;
+
+zsXQmGIHWv = Cylinder(d = 1.5472704mm, h = 14.9710865mm)
+;
+LlkqjHBZsU = Sphere(17.22901mm)
+	.rotate(x = 316.442deg, y = 79.15152deg, z = 187.26819deg)
+;
+zsXQmGIHWv | LlkqjHBZsU;

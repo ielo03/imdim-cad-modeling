@@ -1,0 +1,7 @@
+use std::geo3d::*;
+use std::ops::*;
+
+NinkFrTcob = Sphere(15.878323mm)
+	.rotate(x = 80.9534deg, y = 324.75693deg, z = 347.46347deg)
+;
+NinkFrTcob;

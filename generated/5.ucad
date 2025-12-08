@@ -1,0 +1,10 @@
+use std::geo3d::*;
+use std::ops::*;
+
+PLsxClGOGS = Sphere(6.1687875mm)
+	.translate(x = 9.29657mm, y = 5.895629mm, z = 3.896221mm)
+;
+cTOqWRGTKC = Cube(size_x = 4.3904343mm, size_y = 12.910172mm, size_z = 8.473333mm)
+	.rotate(x = 304.46097deg, y = 114.20589deg, z = 104.41539deg)
+;
+PLsxClGOGS - cTOqWRGTKC;

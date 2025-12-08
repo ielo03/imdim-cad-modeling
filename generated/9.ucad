@@ -1,0 +1,6 @@
+use std::geo3d::*;
+use std::ops::*;
+
+tHRHKcKUpi = Cube(size_x = 18.682705mm, size_y = 7.9651966mm, size_z = 15.254181mm)
+;
+tHRHKcKUpi;

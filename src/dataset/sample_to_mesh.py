@@ -1,6 +1,14 @@
 """Command-line utility to generate GT point clouds from sample DSL.
 
-Each sample directory is expected to contain:
+Preferred (new) sample format: a single `dsl.npz` file in each sample dir:
+
+    dsl.npz containing:
+        hist_tokens : int64, shape [T_hist]
+        hist_params : float32, shape [T_hist, 10]
+        next_tokens : int64, shape [K]
+        next_params : float32, shape [K, 10]
+
+Legacy format (still supported as a fallback):
 
     hist_tokens.npy   # int64, shape [T_hist]
     hist_params.npy   # float32, shape [T_hist, 9]
@@ -14,7 +22,7 @@ the resulting shape and save it as `gt_points.npy` in the same directory.
 Usage examples:
 
     # Process a single sample directory
-    python -m dataset.sample_to_mesh --sample-dir path/to/sample_000
+    python -m dataset.sample_to_mesh --sample-dir path/to/sample_0000
 
     # Process all subdirectories under a root (e.g. dataset/train)
     python -m dataset.sample_to_mesh --root dataset/train
@@ -66,15 +74,67 @@ def _state_to_point_cloud(state: ShapeState, n_points: int, device: torch.device
     )
 
 
-def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
-    """Reconstruct a ShapeState from hist/next tokens and params.
 
-    Expects the following files in `sample_dir`:
-        - hist_tokens.npy : [T_hist]
-        - hist_params.npy : [T_hist, 9]
-        - next_tokens.npy : [K] or scalar
-        - next_params.npy : [K, 9] or [9]
-    """
+def _load_from_dsl_npz(sample_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load hist/next tokens and params from dsl.npz (10D params)."""
+
+    dsl_path = sample_dir / "dsl.npz"
+    if not dsl_path.exists():
+        raise FileNotFoundError(f"Missing dsl.npz in {sample_dir}")
+
+    data = np.load(dsl_path)
+    required_keys = ["hist_tokens", "hist_params", "next_tokens", "next_params"]
+    for k in required_keys:
+        if k not in data:
+            raise KeyError(f"dsl.npz in {sample_dir} missing key {k!r}")
+
+    hist_tokens = np.asarray(data["hist_tokens"], dtype=np.int64)
+    hist_params = np.asarray(data["hist_params"], dtype=np.float32)
+    next_tokens = np.asarray(data["next_tokens"], dtype=np.int64)
+    next_params = np.asarray(data["next_params"], dtype=np.float32)
+
+    # Normalize shapes
+    if hist_tokens.ndim != 1:
+        raise ValueError(f"dsl.npz: hist_tokens must be 1D, got shape {hist_tokens.shape}")
+    if hist_params.ndim != 2 or hist_params.shape[1] != 10:
+        raise ValueError(f"dsl.npz: hist_params must be [T_hist, 10], got shape {hist_params.shape}")
+    if hist_tokens.shape[0] != hist_params.shape[0]:
+        raise ValueError(
+            f"dsl.npz: hist_tokens length {hist_tokens.shape[0]} does not match "
+            f"hist_params length {hist_params.shape[0]}"
+        )
+
+    if next_tokens.ndim == 0:
+        next_tokens = np.array([int(next_tokens)], dtype=np.int64)
+    elif next_tokens.ndim == 1:
+        next_tokens = next_tokens.astype(np.int64)
+    else:
+        raise ValueError(f"dsl.npz: next_tokens must be scalar or 1D, got shape {next_tokens.shape}")
+
+    if next_params.ndim == 1:
+        if next_params.shape[0] != 10:
+            raise ValueError(
+                f"dsl.npz: next_params 1D must have length 10, got {next_params.shape[0]}"
+            )
+        next_params = next_params.reshape(1, 10)
+    elif next_params.ndim == 2 and next_params.shape[1] == 10:
+        pass
+    else:
+        raise ValueError(
+            f"dsl.npz: next_params must be [10] or [K, 10], got shape {next_params.shape}"
+        )
+
+    if next_tokens.shape[0] != next_params.shape[0]:
+        raise ValueError(
+            f"dsl.npz: next_tokens length {next_tokens.shape[0]} does not match "
+            f"next_params length {next_params.shape[0]}"
+        )
+
+    return hist_tokens, hist_params, next_tokens, next_params
+
+
+def _load_from_legacy_npy(sample_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Legacy loader: separate npy files with 9D params."""
 
     hist_tokens_path = sample_dir / "hist_tokens.npy"
     hist_params_path = sample_dir / "hist_params.npy"
@@ -98,7 +158,7 @@ def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
     next_params = np.load(next_params_path, allow_pickle=True)
     next_params = np.asarray(next_params, dtype=np.float32)  # [K, 9] or [9]
 
-    # Normalize shapes
+    # Normalize shapes (legacy: 9D)
     if hist_tokens.ndim != 1:
         raise ValueError(f"hist_tokens.npy must be 1D, got shape {hist_tokens.shape}")
     if hist_params.ndim != 2 or hist_params.shape[1] != 9:
@@ -109,7 +169,6 @@ def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
             f"hist_params length {hist_params.shape[0]}"
         )
 
-    # next_tokens: allow scalar or 1D
     if next_tokens.ndim == 0:
         next_tokens = np.array([int(next_tokens)], dtype=np.int64)
     elif next_tokens.ndim == 1:
@@ -117,7 +176,6 @@ def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
     else:
         raise ValueError(f"next_tokens.npy must be scalar or 1D, got shape {next_tokens.shape}")
 
-    # next_params: allow [9] or [K, 9]
     if next_params.ndim == 1:
         if next_params.shape[0] != 9:
             raise ValueError(
@@ -134,6 +192,22 @@ def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
             f"next_tokens length {next_tokens.shape[0]} does not match "
             f"next_params length {next_params.shape[0]}"
         )
+
+    return hist_tokens, hist_params, next_tokens, next_params
+
+
+def build_state_from_sample_dir(sample_dir: Path) -> ShapeState:
+    """Reconstruct a ShapeState from a sample directory.
+
+    Preferred: load from dsl.npz with 10D params; fallback: legacy 9D npy files.
+    """
+
+    dsl_path = sample_dir / "dsl.npz"
+    if dsl_path.exists():
+        hist_tokens, hist_params, next_tokens, next_params = _load_from_dsl_npz(sample_dir)
+    else:
+        # Legacy path (9D params); still supported
+        hist_tokens, hist_params, next_tokens, next_params = _load_from_legacy_npy(sample_dir)
 
     state = ShapeState()
 
@@ -187,13 +261,14 @@ def generate_gt_points_for_sample(
 def iter_sample_dirs(root: Path):
     """Yield all subdirectories of `root` that look like sample dirs.
 
-    A directory is considered a sample dir if it contains `hist_tokens.npy`.
+    A directory is considered a sample dir if it contains either
+    `dsl.npz` (preferred) or `hist_tokens.npy` (legacy).
     """
 
     for p in sorted(root.iterdir()):
         if not p.is_dir():
             continue
-        if (p / "hist_tokens.npy").exists():
+        if (p / "dsl.npz").exists() or (p / "hist_tokens.npy").exists():
             yield p
 
 
