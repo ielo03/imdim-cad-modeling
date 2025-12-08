@@ -1,447 +1,493 @@
-# Design (Simplified and Project-Ready)
+# IMDIM CAD Modeling — Full Design
 
-Goal: Generate a sequence of parametric primitives that approximate a target mesh. Use a transformer to pick primitive types and parameters. Use a simple geometry interpreter so every token always produces a valid shape.
+> **Audience:** professor + teammates  
+> **Stack:** Python + PyTorch for learning, Rust + MicroCAD/ucad for high‑fidelity geometry & point clouds
 
----
+Goal: learn to convert a **target 3D shape** (given as a point cloud) into a **short program of parametric primitives** (BOX, SPHERE, CYLINDER with pose + sign) that approximates that shape. The program is represented in a small DSL; a transformer generates the token sequence; a geometry backend turns the program into a point cloud; losses/rewards compare that to the target.
 
-## Core DSL (append-only, simplest viable)
-
-State: a list of primitives, each with:
-
-- type: BOX / SPHERE / CYLINDER (keep 2–3 types)
-- params: position + size (predict by MLP)
-- role: positive or negative
-
-Tokens:
-
-- ADD_BOX
-- ADD_SPHERE
-- ADD_CYLINDER
-- MAKE_LAST_NEGATIVE
-- END
-
-Evaluation rule:
-
-```
-shape = empty
-for prim in primitives:
-    if prim.role == positive:
-        shape = shape ∪ prim
-    else:
-        shape = shape \ prim
-final_shape = shape
-```
-
-This removes the need for UNION/SUBTRACT tokens or stack-based CSG. Far fewer invalid programs and easier training.
-
-This sequential add/subtract evaluation allows the policy to recover from overly large negative primitives by adding new positives afterward, improving iterative feedback.
+This doc describes the DSL, state machine, geometry backend, model architecture, dataset format, and training flow (supervised pretraining now, RL later as future work).
 
 ---
 
-## Token Semantics
+## 1. High‑Level Architecture
 
-ADD\_\*: append a primitive with default role "positive".
-MAKE_LAST_NEGATIVE: flip the role of the last primitive (mask this token if no primitive exists).
-END: stop program generation early.
+Pipeline:
 
-Mask illegal tokens:
+1. **Input:** ground‑truth point cloud `gt_points` sampled from a target mesh (STL/PLY).
 
-- If no primitive exists, mask MAKE_LAST_NEGATIVE.
-- Optionally mask END on the first step.
+   - For synthetic training data we can use either:
+     - Python analytic primitives/CSG, or
+     - Rust + MicroCAD/ucad to generate more realistic meshes/fusion shapes and sample point clouds.
 
-All other invalid actions are impossible by construction.
+2. **State machine (`ShapeState`):** holds a list of primitives with parameters + sign (positive/negative). It applies a sequence of DSL tokens and parameter vectors to maintain an internal representation of the current CAD program.
 
----
+3. **Geometry backend (`geometry_backend.py`):**
 
-## Model
+   - Converts a `ShapeState` into an approximate point cloud `cur_points` using simple per‑primitive sampling and union/difference logic in Python.
+   - Used online during training and RL because it’s fast and differentiable enough to support Chamfer‑based feedback.
 
-Transformer (autoregressive decoder):
+4. **Model (PyTorch):**
 
-- Input: previous tokens (+ optional learned embedding of partial shape state)
-- Output each step:
-  - primitive_type (categorical)
-  - parameters via MLP head
+   - PointNet encoder for point clouds.
+   - Transformer decoder over DSL token histories.
+   - Token head (predicts next DSL token).
+   - Parameter head (predicts 10‑D primitive parameters including sign).
 
-### Hidden State and Parameter Inputs
+5. **Training loop (`pretrain.py`):**
 
-Each decoding step t produces a transformer hidden state `h_t`. The parameter MLP receives a concatenation of:
+   - Supervised pretraining with ground‑truth token sequences + parameters and point clouds.
+   - Loss = parameter MSE + sign BCE + token cross‑entropy (+ optional error embedding terms).
+   - Validation loop and checkpointing of best model.
 
-- `h_t`: transformer context of the partial program
-- `gt_embed`: global embedding of the ground-truth point cloud (PointNet-style per-point MLP + max/mean pool)
-- `tok_emb`: learned embedding of the current DSL token
-- `err_emb` (optional later): embedding capturing current predicted-vs-GT error features
-
-The parameter MLP outputs continuous primitive parameters (e.g., position and scale). Primitive tokens consume these parameters; non-primitive tokens ignore them.
+6. **Future RL:** treat the token head as a policy over DSL tokens, with reward from geometry backend or from MicroCAD‑based point clouds.
 
 ---
 
-## Geometry
+## 2. DSL and Program Representation
 
-Primitives -> analytic mesh or sampled points.
-Sample a few hundred points per shape (uniform by area). Cache ground-truth samples.
+We use a **simple, append‑only DSL** that only manipulates a flat list of primitives. No nested trees, no arbitrary CSG nodes.
 
-Final predicted mesh → Chamfer distance + optional normal loss.
+### 2.1 Primitive Representation
 
----
+Each primitive is a dict/record with:
 
-## Training (Hybrid)
+- `kind`: `"box" | "sphere" | "cylinder"`
+- `center`: `(cx, cy, cz)`
+- `size_params`: `(p0, p1, p2)` (interpreted per primitive)
+- `rotation`: `(rx, ry, rz)` in degrees (Euler angles)
+- `sign`: `+1` for **positive** solid, `-1` for **negative** cutout
 
-Do both:
+These are derived from a **10‑D parameter vector** produced by the model when a primitive token is emitted:
 
-1. Gradient-based loss (Chamfer + optional normals) to refine continuous parameters.
-2. RL reward for structure:
-   - negative Chamfer
-   - penalty for too many primitives
-   - small penalty per token (encourages shorter programs)
-
-The transformer learns discrete tokens with RL. The parameter MLP learns continuous values with gradients.
-
-### Parameter Pretraining
-
-To pretrain parameters with known ground-truth tokens and parameters:
-
-1. Implement a minimal transformer decoder first.
-2. Teacher-force ground-truth token sequences to obtain hidden states `h_t`.
-3. Encode the GT mesh once per example via a small PointNet module to obtain `gt_embed`.
-4. Input to the parameter MLP at step t is `concat(h_t, gt_embed, tok_emb)` (skip `err_emb` initially).
-5. Supervise parameters via MSE:
-
-```
-L_t = MSE(params_pred_t, params_gt_t)
+```text
+params[0:3] = (cx, cy, cz)       # position / center
+params[3:6] = (p0, p1, p2)       # size/radius/height (primitive‑specific)
+params[6:9] = (rx, ry, rz)       # rotation angles in degrees
+params[9]   = sign_raw           # real‑valued sign logit
 ```
 
-6. Sum/average `L_t` over steps and backprop to train the encoder, transformer backbone, and parameter MLP.
-7. After pretraining, add the token RL head and switch to hybrid training.
+Sign decoding:
 
-This ensures a good initialization for the parameter head before RL fine-tuning.
-
----
-
-## Reward / Loss
-
-Reward:
-
-```
-R = -Chamfer(final_mesh, GT) - lambda * (#primitives)
+```text
+sign_prob = sigmoid(sign_raw)
+role = POSITIVE if sign_prob >= 0.5 else NEGATIVE
 ```
 
-Loss:
+**Interpretation of size params**:
 
-```
-L = Chamfer + normal_loss(optional)
-```
+- BOX: `p0, p1, p2` → size `(sx, sy, sz)`.
+- SPHERE: `p0` = radius, `(p1, p2)` ignored or used for optional ellipsoid scaling.
+- CYLINDER: `p0` = radius, `p1` = height, `p2` optional.
 
-Backprop L through parameter heads. Use RL (policy gradient or PPO) for token selection.
+We store the raw 10‑D vector in the state so we can regenerate exact geometry later.
 
----
+### 2.2 Token Vocabulary
 
-## Implementation Steps
-
-1. Define DSL tokens and masking rules.
-2. Write apply_token that appends primitives or flips role.
-3. Write evaluate_shape that unions positives and subtracts negatives.
-4. Sample GT mesh points once and cache.
-5. Train with Chamfer loss first (warm start, maybe teacher-forcing simple sequences).
-6. Add RL after the model produces roughly valid shapes.
-
----
-
-## Scope
-
-Do NOT implement full CSG trees, complex boolean logic or many primitive types. Stick to the minimal DSL above. This is the most stable approach you can finish in a shorter time and still demonstrate hybrid training, transformer decoding, and differentiable geometric feedback.
-
-# Design (Simplified and Project-Ready)
-
-Goal: Generate a sequence of parametric primitives that approximate a target mesh. Use a transformer to pick primitive types and a parameter head to choose continuous parameters **including a sign flag** (positive/negative). Use a simple geometry interpreter so every token always produces a valid shape.
-
----
-
-## Core DSL (append-only, simple, RL-friendly)
-
-State: a list of primitives, each with:
-
-- `type`: `BOX` / `SPHERE` / `CYLINDER`
-- `params`: 9D geometry vector (position, size, rotation)
-- `role`: `POSITIVE` or `NEGATIVE` (derived from the 10th parameter output by the model)
-
-Tokens (discrete actions):
+We use a small, RL‑friendly token set:
 
 - `ADD_BOX`
 - `ADD_SPHERE`
 - `ADD_CYLINDER`
-- `UNDO_LAST` (remove last primitive if any)
-- `END` (terminate sequence)
+- `UNDO_LAST`
+- `END`
 
-Parameter vector (continuous output per primitive step):
+**Semantics:**
 
-```text
-params[0:3] = (cx, cy, cz)       # center
-params[3:6] = (p0, p1, p2)       # size / radius / height (interpreted per primitive)
-params[6:9] = (rx, ry, rz)       # rotation angles
-params[9]   = sign_raw           # real-valued sign logit for POSITIVE vs NEGATIVE
-```
+- `ADD_*`:
 
-The **sign** is not a separate token. Instead, the 10th parameter `sign_raw` is interpreted as:
-
-```text
-role = POSITIVE if sigmoid(sign_raw) >= 0.5 else NEGATIVE
-```
-
-This means each primitive is born positive or negative in a single step. There is no intermediate "wrong" positive state for cutouts; the geometry and reward always see the intended sign.
-
----
-
-## Evaluation Rule (Geometry Semantics)
-
-We use simple sequential CSG semantics over primitives:
-
-```text
-shape = empty
-for prim in primitives_in_order:
-    if prim.role == POSITIVE:
-        shape = shape ∪ prim
-    else:  # NEGATIVE
-        shape = shape \ prim
-final_shape = shape
-```
-
-The geometry backend **does not build full CSG trees**. Instead, it maintains a point cloud approximation by:
-
-- sampling points for each POSITIVE primitive and concatenating them,
-- removing any existing points that fall inside NEGATIVE primitives.
-
-This gives an approximate but consistent notion of add vs subtract that is cheap enough for RL.
-
----
-
-## Token Semantics and Masking
-
-- `ADD_*` (primitive tokens):
-
-  - The transformer chooses a primitive token.
-  - The parameter head outputs a 10D vector.
-  - The state machine:
-    - decodes center, size, rotation from the first 9 dims,
-    - interprets `sign_raw` as POSITIVE/NEGATIVE,
-    - appends a new primitive with that role.
+  - Model chooses this token at step `t`.
+  - Parameter head outputs 10‑D vector for this step.
+  - State machine decodes it into a primitive and appends to the list.
 
 - `UNDO_LAST`:
 
-  - If there is at least one primitive in the list, remove the last primitive.
-  - If there is none, the token is masked out.
+  - If there is at least one primitive, pop the last one.
+  - If there is none, this token is masked (cannot be chosen).
 
 - `END`:
-  - Terminate program generation.
+  - Terminate sequence/program.
 
-Mask illegal tokens dynamically:
+### 2.3 Masking Rules
 
-- If no primitive exists, mask `UNDO_LAST`.
-- Optionally mask `END` on the very first step.
+To avoid obvious invalid actions:
 
-All other invalid actions are impossible by construction.
+- Mask `UNDO_LAST` if there are **no primitives** in the current state.
+- Optionally mask `END` on the **first step** so you always add at least one primitive.
 
-This sequential add/subtract/undo evaluation allows the policy to recover from overly large negative primitives by adding new positives afterward or undoing mistakes, improving iterative feedback.
+Everything else is valid by construction; we do not allow arbitrary structural tokens, so the policy always produces syntactically valid programs.
 
 ---
 
-## Model
+## 3. State Machine (`state_machine.py`)
 
-### Overview
+The state machine is a pure Python class that applies token + parameter actions to build an internal list of primitives.
 
-We use an autoregressive Transformer decoder as the backbone, plus separate heads for:
+### 3.1 Core Data Structure
 
-- **token prediction** (which discrete action next),
-- **parameter + sign prediction** (continuous geometry and sign flag).
+```python
+class Primitive(NamedTuple):
+    kind: str              # "box" | "sphere" | "cylinder"
+    center: np.ndarray     # (3,)
+    size: np.ndarray       # (3,)
+    rotation: np.ndarray   # (3,) degrees
+    sign: int              # +1 (positive) or -1 (negative)
+    raw_params: np.ndarray # (10,) original param vector
 
-At each decoding step \(t\):
-
-- Input: previous tokens (and optionally their parameters) and global context.
-- Transformer produces hidden state `h_t` for the last step.
-- From `h_t` we derive:
-  - token logits (for next token),
-  - param+sign vector (10D).
-
-### Hidden State and Parameter Inputs
-
-Each decoding step `t` uses a hidden state `h_t` from the transformer. The parameter head receives a concatenation of:
-
-- `h_t`: transformer context of the partial program (token/history embedding),
-- `gt_embed`: global embedding of the ground-truth point cloud (PointNet-style per-point MLP + max/mean pool),
-- `tok_emb`: learned embedding of the **chosen** DSL token at step `t` (e.g., `ADD_BOX`, `ADD_SPHERE`, etc.),
-- `err_emb` (optional later): embedding of current predicted-vs-GT error features.
-
-The parameter head outputs a 10D vector:
-
-```text
-out_t = [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
+class ShapeState:
+    primitives: List[Primitive]
+    done: bool
 ```
 
-- Geometry parameters: `params_geom = out_t[0:9]`.
-- Sign logit: `sign_raw = out_t[9]`.
-- Sign probability: `sign_prob = sigmoid(sign_raw)`.
-- Sign label used by the state machine: `POSITIVE` if `sign_prob >= 0.5`, else `NEGATIVE`.
+### 3.2 Applying Tokens
 
-Primitive tokens consume these parameters; non-primitive tokens ignore the continuous outputs for that step.
+At step `t`, we have:
 
----
+- a token `tok_t` (int ID),
+- a 10‑D parameter vector `params_t` (for primitive tokens only).
 
-## Geometry Backend
+`ShapeState.apply_action(tok_t, params_t)` implements:
 
-- Primitive types: BOX / SPHERE / CYLINDER.
-- Roles: POSITIVE / NEGATIVE (driven entirely by the 10th parameter).
-- Each primitive is converted into an analytic shape from which we can:
-  - sample interior or surface points for positives,
-  - test membership for negatives.
+- If `tok_t` is `ADD_BOX` / `ADD_SPHERE` / `ADD_CYLINDER`:
 
-Approximate point cloud evaluation:
+  - Decode `params_t` into `center`, `size`, `rotation`, `sign` as above.
+  - Append a new `Primitive` of the corresponding kind.
 
-1. Maintain a global point cloud `pts`.
-2. For each primitive in order:
-   - If POSITIVE: sample `n_pos` points from that primitive and concatenate to `pts`.
-   - If NEGATIVE: remove any points in `pts` that fall inside the negative primitive.
+- If `tok_t` is `UNDO_LAST`:
 
-Chamfer distance is computed between:
+  - If `primitives` not empty, pop the last one.
 
-- GT point cloud (sampled once per GT mesh/state), and
-- predicted point cloud from this backend.
+- If `tok_t` is `END`:
+  - Set `done = True`.
 
-The same sampler is used for both training GT (for synthetic DSL samples) and predicted shapes, ensuring consistent reward.
+### 3.3 State Export for Geometry
 
----
+The geometry backend consumes the state as a list of primitives:
 
-## Training (Hybrid)
-
-We use a hybrid setup:
-
-1. **Supervised pretraining** for:
-
-   - token head (next-token prediction from ground-truth sequences),
-   - parameter head (MSE on geometry and BCE on sign).
-
-2. **RL fine-tuning** for token structure:
-   - reward from geometry backend (Chamfer + penalties),
-   - policy gradient or PPO on token head,
-   - parameter head can continue to receive gradient from Chamfer (as a continuous loss) or be partially frozen.
-
-### Parameter + Sign Pretraining
-
-To pretrain the parameter head with known ground-truth tokens and parameters:
-
-1. Implement a minimal Transformer decoder and token head.
-2. Teacher-force ground-truth token sequences to obtain hidden states `h_t`.
-3. Encode the GT mesh once per example via PointNet to obtain `gt_embed`.
-4. At step `t`, build the param head input as:
-
-   ```text
-   x_t = concat(h_t, gt_embed, tok_emb[, err_emb])
-   ```
-
-5. Param head outputs:
-
-   ```text
-   out_t = param_head(x_t)  # 10D
-   params_pred_t = out_t[0:9]
-   sign_logit_t  = out_t[9]
-   ```
-
-6. Supervise geometry via MSE and sign via BCE-with-logits:
-
-   ```text
-   L_params_t = MSE(params_pred_t, params_gt_t)
-   L_sign_t   = BCEWithLogits(sign_logit_t, sign_gt_t)
-   ```
-
-   where `sign_gt_t ∈ {0,1}` indicates POSITIVE/NEGATIVE from the dataset.
-
-7. Sum/average `L_params_t + λ_sign * L_sign_t` over primitive steps and backprop to train:
-   - PointNet encoder,
-   - transformer backbone,
-   - parameter head.
-
-### Token Pretraining
-
-In parallel, we pretrain the token head with cross-entropy loss on the ground-truth next token:
-
-```text
-L_token_t = CrossEntropy(token_logits_t, token_gt_t)
+```python
+state.to_primitives() -> List[Primitive]
 ```
 
-Total supervised pretraining loss (per example):
-
-```text
-L_supervised = Σ_t L_token_t
-             + λ_params Σ_t L_params_t (for primitive steps)
-             + λ_sign Σ_t L_sign_t    (for primitive steps)
-```
-
-### RL Reward
-
-After supervised pretraining, we can switch to a hybrid RL setup where:
-
-- the token head is treated as a policy over tokens,
-- the parameter head continues to be trained via Chamfer-based gradients (optional),
-- the reward encourages accurate and compact shapes.
-
-Reward for an episode (final shape):
-
-```text
-R = -Chamfer(pred_points, gt_points)
-    - λ_prim * (#primitives)
-    - λ_len  * (sequence_length)
-```
-
-Optionally, intermediate rewards can be given after each step using the current predicted point cloud.
+No geometry computation happens in the state machine itself; that’s delegated to `geometry_backend.py`.
 
 ---
 
-## Implementation Steps (updated)
+## 4. Geometry Backend (`geometry_backend.py`)
 
-1. **DSL + State Machine**
+This is the **Python approximation** used during training.
 
-   - Define token enum: `ADD_BOX`, `ADD_SPHERE`, `ADD_CYLINDER`, `UNDO_LAST`, `END`.
-   - Implement `ShapeState.apply(token, params)` where:
-     - primitive tokens interpret a 10D param vector and append a POSITIVE/NEGATIVE primitive based on `sign_raw`,
-     - `UNDO_LAST` pops the last primitive if any,
-     - `END` flags termination.
+### 4.1 Primitive Sampling & Membership
 
-2. **Geometry Backend**
+For each primitive we implement:
 
-   - Implement analytic membership + sampling for BOX/SPHERE/CYLINDER.
-   - Implement sequential union/subtraction over a point cloud as described.
-   - Add a function `state_to_point_cloud(state, n_points, device)` used for both training and evaluation.
+- `sample_points(primitive, n_points)` → `[n_points, 3]` in world coords.
+- `is_inside(primitive, points)` → boolean mask `[N]` for a batch of points.
 
-3. **PointNet Encoder**
+This uses analytic formulas for box/sphere/cylinder in local coordinates (after applying rotation + translation).
 
-   - Implement `PointNetEncoder(points) -> gt_embed` for GT point clouds.
+### 4.2 Sequential Union/Difference Over Point Clouds
 
-4. **Transformer + Heads**
+We maintain a global point cloud representing the current predicted shape.
 
-   - Transformer decoder over token histories.
-   - Token head: linear layer from `h_t` to logits over tokens.
-   - Param head: MLP from `concat(h_t, gt_embed, tok_emb[, err_emb])` to a 10D vector.
+```python
+def state_to_point_cloud(state: ShapeState, n_points: int, device) -> torch.Tensor:
+    """Approximate predicted shape as a point cloud.
 
-5. **Supervised Pretraining**
+    Returns points [N, 3] in torch.Tensor.
+    """
+    pts = empty
+    for prim in state.primitives_in_order():
+        if prim.sign > 0:  # POSITIVE
+            pts_prim = sample_points(prim, n_pos_per_prim)
+            pts = concat(pts, pts_prim)
+        else:  # NEGATIVE
+            # Remove points of pts that fall inside the negative primitive
+            mask = ~is_inside(prim, pts)
+            pts = pts[mask]
 
-   - Build datasets of (GT mesh / point cloud, token sequences, param sequences including sign).
-   - Train with `L_supervised` as above.
+    # Optional: resample / downsample pts to exactly n_points for stability
+    return resample_to_fixed_size(pts, n_points)
+```
 
-6. **RL Fine-Tuning (Optional)**
-   - Wrap the state machine + geometry backend + Chamfer reward into an RL environment.
-   - Treat the token head as the policy; optionally treat params as part of the policy or keep them under gradient-based refinement.
-   - Use policy gradient / PPO to improve token selection under the geometric reward.
+We also handle empty cases (no primitives → return zeros or random placeholder points) so the model utils never see length‑0 point clouds when that would break downstream ops.
+
+### 4.3 Error Metrics and Embedding
+
+We compute a **richer error embedding** between GT and current point clouds, used as conditioning for the transformer:
+
+- Chamfer distance (scalar)
+- Centroid distance (L2 distance between point cloud centroids)
+- log scale ratio (log of ratio of bounding box diagonals)
+
+`compute_error_embedding(gt_points, cur_points) -> [B, 3]` returns:
+
+```text
+[ chamfer, centroid_dist, log_scale_ratio ]
+```
+
+If either set is empty, we return zeros.
+
+This embedding is concatenated to other conditioning features and fed into the transformer at every step.
 
 ---
 
-## Scope
+## 5. Model Architecture
 
-Do **not** implement full CSG trees, complex boolean logic, or many primitive types. Stick to:
+All model code lives under `src/model/`.
 
-- a minimal DSL with a few primitives,
-- sign handled as the 10th continuous parameter,
-- a simple, consistent point-cloud-based geometry backend.
+### 5.1 PointNet Encoder (`pointnet_encoder.py`)
 
-This is the most stable approach you can finish in a short time and still demonstrate:
+- Input: `points : [B, N, 3]`.
+- Transpose to `[B, 3, N]` and apply a small MLP with 1D conv layers:
+  - `Conv1d(3 → 64) → ReLU → Conv1d(64 → 128) → ReLU → Conv1d(128 → out_dim)`.
+- Max‑pool over `N` to get `[B, out_dim]`.
 
-- hybrid training (supervised + RL),
-- transformer-based program generation,
-- differentiable geometric feedback for shape approximation.
+We instantiate one PointNet encoder and reuse it for:
+
+- `gt_points` → `gt_embed` (global embedding of target shape).
+- `cur_points` → `cur_embed` (global embedding of current prediction).
+
+### 5.2 Transformer Decoder (`transformer.py`)
+
+- Input tokens: `gt_tokens : [B, T]` (history + next tokens if teacher forcing).
+- Token embedding: `token_emb : [B, T, d_model]`.
+- Add learned positional encodings.
+- Optionally condition on:
+  - `gt_embed : [B, d_model]`
+  - `cur_embed : [B, d_model]`
+  - `err_embed : [B, 3]` (after projecting to `d_model`).
+
+The transformer runs over the sequence of tokens and returns:
+
+```text
+hidden_states : [B, T, d_model]
+```
+
+We use **batch_first=True** so indexing is natural.
+
+### 5.3 Token Head (`token_head.py`)
+
+- Input: `hidden_states : [B, T, d_model]`.
+- Output: `token_logits : [B, T, V]` where `V` is vocab size (number of DSL tokens).
+
+Implementation: single linear layer:
+
+```python
+self.fc = nn.Linear(d_model, vocab_size)
+```
+
+During pretraining we always use **teacher forcing**: the transformer input tokens are the GT tokens, and we train the head to predict the same GT tokens at each position.
+
+### 5.4 Parameter Head (`param_head.py`)
+
+The parameter head is conditioned on:
+
+- hidden state `h_t : [B, d_model]` for step `t`,
+- `gt_embed : [B, gt_dim]`,
+- `cur_embed : [B, gt_dim]`,
+- error embedding `err_embed : [B, 3]`,
+- token embedding `tok_emb_t : [B, tok_dim]` for the **current** step.
+
+We build per‑step input:
+
+```text
+x_t = concat(h_t, gt_embed, cur_embed, tok_emb_t, err_embed)  # [B, D_total]
+```
+
+The head is a small MLP:
+
+```python
+self.mlp = nn.Sequential(
+    nn.Linear(D_total, hidden_dim),
+    nn.ReLU(),
+    nn.Linear(hidden_dim, 10),   # 10D geometry + sign
+)
+```
+
+Output interpretation:
+
+- `out[..., 0:9]` → geometry params.
+- `out[..., 9]` → sign logit.
+
+### 5.5 Model Wrapper / Utilities (`model_utils.py`)
+
+`build_cad_model(...)` constructs:
+
+- `pointnet`
+- `transformer`
+- `param_head`
+- `token_head`
+
+and returns them inside a `ModelComponents` dataclass.
+
+`forward_params_only(...)` implements the **supervised pretraining forward path**:
+
+1. Encode `gt_points` → `gt_embed`.
+2. Encode `cur_points` (or zeros if empty) → `cur_embed`.
+3. Compute `err_embed` (or zeros if empty).
+4. Run `transformer(gt_tokens, gt_embed, cur_embed, err_embed)` → `hidden_states`.
+5. Run `token_head(hidden_states)` → `token_logits`.
+6. For each step `t`, build `x_t` and run `param_head(x_t)` → `params_pred_t`.
+7. Stack all `params_pred_t` to `[B, T, 10]`.
+
+---
+
+## 6. Dataset Format
+
+All samples are stored as `.npz` files:
+
+- Train: `dataset/train/sample_XXXXX.npz`
+- Val: `dataset/val/sample_XXXXX.npz`
+
+Each sample contains:
+
+- `gt_points : [N_gt, 3]` — target point cloud.
+- `cur_points : [N_cur, 3]` — point cloud obtained by applying the **history** DSL program (can be empty for early steps).
+- `gt_tokens : [T]` — integer sequence of DSL tokens (history + next steps).
+- `gt_params : [T, 10]` — 10‑D parameter vectors aligned with `gt_tokens`.
+
+The **history vs next** is encoded simply by where in the sequence you supervise the model; pretraining uses full sequences.
+
+A DataLoader (`NPZCADDataset` in `pretrain.py` or a separate module) batches these into:
+
+- `gt_points : [B, N_gt, 3]`
+- `cur_points : [B, N_cur, 3]`
+- `gt_tokens : [B, T]`
+- `gt_params : [B, T, 10]`
+
+Padding/variable lengths are handled at the dataset/dataloader level or by keeping batch_size small.
+
+---
+
+## 7. Training Flow (`pretrain.py`)
+
+### 7.1 Supervised Pretraining Objective
+
+For a batch:
+
+1. Forward pass via `forward_params_only`:
+
+```python
+params_pred, hidden_states, token_logits = forward_params_only(
+    components, gt_points, cur_points, gt_tokens
+)
+```
+
+2. Parameter regression loss (only on primitive tokens):
+
+```python
+L_params = MSE(params_pred[primitive_steps, :9], gt_params[primitive_steps, :9])
+L_sign   = BCEWithLogits(params_pred[primitive_steps, 9], sign_gt[primitive_steps])
+```
+
+3. Token auxiliary loss (all steps):
+
+```python
+L_token = CrossEntropy(token_logits, gt_tokens)
+```
+
+4. Total loss (current implementation):
+
+```python
+loss = L_params + L_sign_weight * L_sign + L_token
+```
+
+### 7.2 Training & Validation Loops
+
+- `train_epoch(...)`:
+
+  - Sets all modules to `train()`.
+  - Iterates batches from train dataloader.
+  - Computes losses, backprop, optimizes.
+  - Logs average train loss.
+
+- `eval_epoch(...)`:
+
+  - Sets all modules to `eval()`.
+  - Uses `torch.no_grad()`.
+  - Computes the same loss definition on the val dataloader.
+  - Returns **avg val loss**.
+
+- In `main()`:
+  - Build train dataloader from `--data_root`.
+  - Optionally build val dataloader from `--val_root`.
+  - Track best val loss.
+  - Save best model state dict to `models/best.pt` whenever avg val loss improves.
+
+### 7.3 CLI
+
+`pretrain.py` supports:
+
+- `--data_root dataset/train`
+- `--val_root dataset/val`
+- `--epochs N`
+- `--batch_size B`
+- `--lr LR`
+- `--max_seq_len T`
+- `--device cpu|cuda`
+
+Example:
+
+```bash
+python src/model/pretrain.py \
+  --data_root dataset/train \
+  --val_root dataset/val \
+  --epochs 20 \
+  --batch_size 1
+```
+
+---
+
+## 8. MicroCAD / Rust Integration (Future Work)
+
+Right now, point clouds for GT and current predictions are generated in **Python** using analytic primitives and a simple CSG over point sets. This keeps training fast and debuggable.
+
+Longer‑term, we can:
+
+1. Swap out or augment the GT point clouds with ones generated by **Rust + MicroCAD/ucad** DSL:
+
+   - Rust library generates complex CAD geometry.
+   - MicroCAD/ucad can evaluate the program and expose a fast method to sample point clouds.
+   - Rust side writes `.npy` or `.npz` point clouds that the Python side loads directly.
+
+2. Potentially use the same DSL (or a compatible subset) for both RL and offline generation.
+
+The design keeps the DSL + state machine in Python **compatible in spirit** with a richer MicroCAD DSL so that we can move the evaluation backend to Rust later without retraining everything from scratch.
+
+---
+
+## 9. Future RL Phase (Outline)
+
+Once supervised pretraining is stable:
+
+- Treat the token head as a policy over tokens.
+- Use the state machine + geometry backend as the environment.
+- Reward:
+  - `-Chamfer(pred, gt)`
+  - penalties on number of tokens / primitives.
+- Generate full episodes by sampling tokens until `END` or max length.
+- Use policy gradient / PPO to improve token policy.
+- Optionally finetune parameter head with RL as well or keep it under gradient‑based losses from Chamfer.
+
+---
+
+## 10. What’s Done vs What’s Left
+
+**Implemented / in progress:**
+
+- DSL design and state machine concept.
+- Geometry backend with primitive sampling and sequential union/difference.
+- PointNet encoder.
+- Transformer + token head.
+- Param head (10D output including sign).
+- Model wiring + forward path (`forward_params_only`).
+- Dataset format using `.npz` samples.
+- Supervised pretraining loop with train/val and best‑model checkpointing.
+
+**Future / possible extensions:**
+
+- Swap Python geometry backend for Rust + MicroCAD/ucad in the GT pipeline.
+- Introduce RL for token structure optimization.
+- Extend primitive set (e.g., ellipsoids, tori) if time permits.
+- Better normalization of coordinates, sizes, and rotations.
+
+This design is scoped so that **supervised pretraining is realistic to complete now**, with a clear path to plug in MicroCAD and RL later if time and compute allow.

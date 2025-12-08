@@ -38,9 +38,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from geometry_backend import chamfer_distance
+
 from model.pointnet_encoder import PointNetEncoder
 from model.transformer import CADTransformer
 from model.param_head import ParamHead
+from model.token_head import TokenHead
 from state_machine import ShapeState, Token
 
 
@@ -51,16 +54,20 @@ class ModelComponents:
     Attributes
     ----------
     pointnet : PointNetEncoder
-        Encodes GT point clouds into `gt_embed`.
+        Encodes point clouds (GT and current) into global embeddings.
     transformer : CADTransformer
-        Autoregressive backbone over DSL tokens.
+        Autoregressive backbone over DSL tokens, conditioned on
+        gt_embed, cur_embed, and an error embedding.
     param_head : ParamHead
         Predicts the 10D parameter vector at each step (9 geom + sign).
+    token_head : TokenHead
+        Predicts logits over the DSL token vocabulary at each step.
     """
 
     pointnet: PointNetEncoder
     transformer: CADTransformer
     param_head: ParamHead
+    token_head: TokenHead
 
     def to(self, device: torch.device | str) -> "ModelComponents":
         """Move all submodules to a given device and return self."""
@@ -69,7 +76,75 @@ class ModelComponents:
         self.pointnet.to(dev)
         self.transformer.to(dev)
         self.param_head.to(dev)
+        self.token_head.to(dev)
         return self
+
+
+def compute_error_embedding(
+    gt_points: torch.Tensor,
+    cur_points: torch.Tensor,
+) -> torch.Tensor:
+    """Compute a richer error embedding from GT and current point clouds.
+
+    We include three scalars per batch element:
+
+        1. Symmetric Chamfer distance between cur and GT clouds.
+        2. L2 distance between centroids of cur and GT.
+        3. Log scale ratio of bounding-box diagonals (cur / GT).
+
+    This yields a [B, 3] error embedding that can be projected inside
+    the Transformer.
+    """
+
+    if gt_points.dim() != 3 or cur_points.dim() != 3:
+        raise ValueError(
+            f"gt_points and cur_points must be [B, N, 3] / [B, M, 3], got "
+            f"{gt_points.shape} and {cur_points.shape}"
+        )
+
+    B = gt_points.shape[0]
+
+    # If either cloud has zero points, return a zero error embedding.
+    # This avoids crashes in Chamfer / centroid / bbox ops and gives
+    # the model a consistent "no-geometry" signal.
+    if gt_points.shape[1] == 0 or cur_points.shape[1] == 0:
+        return torch.zeros(
+            B,
+            3,
+            device=gt_points.device,
+            dtype=gt_points.dtype,
+        )
+
+    # 1) Chamfer distance (no grad through geometry backend)
+    with torch.no_grad():
+        chamf = chamfer_distance(cur_points, gt_points)  # [B] or scalar
+
+    if not isinstance(chamf, torch.Tensor):
+        chamf = torch.as_tensor(chamf, device=gt_points.device, dtype=gt_points.dtype)
+
+    if chamf.dim() == 0:
+        chamf = chamf.expand(B)
+    elif chamf.shape[0] != B:
+        raise ValueError(f"Chamfer output batch size mismatch: {chamf.shape} vs B={B}")
+
+    # 2) Centroid distance
+    centroid_gt = gt_points.mean(dim=1)   # [B, 3]
+    centroid_cur = cur_points.mean(dim=1) # [B, 3]
+    centroid_dist = torch.linalg.norm(centroid_gt - centroid_cur, dim=-1)  # [B]
+
+    # 3) Bounding-box scale ratio (log of diagonal length ratio)
+    eps = 1e-6
+    gt_min, _ = gt_points.min(dim=1)
+    gt_max, _ = gt_points.max(dim=1)
+    cur_min, _ = cur_points.min(dim=1)
+    cur_max, _ = cur_points.max(dim=1)
+
+    gt_diag = torch.linalg.norm(gt_max - gt_min, dim=-1).clamp_min(eps)  # [B]
+    cur_diag = torch.linalg.norm(cur_max - cur_min, dim=-1).clamp_min(eps)  # [B]
+    scale_ratio = torch.log((cur_diag / gt_diag).clamp_min(eps))  # [B]
+
+    err_embed = torch.stack([chamf, centroid_dist, scale_ratio], dim=-1)  # [B, 3]
+    return err_embed
 
 
 def build_cad_model(
@@ -81,7 +156,7 @@ def build_cad_model(
     max_seq_len: int = 64,
     tok_emb_dim: Optional[int] = None,
     hidden_dim: int = 256,
-    err_dim: int = 0,
+    err_dim: int = 3,
     device: Optional[torch.device | str] = None,
 ) -> ModelComponents:
     """Construct a consistent set of model components for the CAD task.
@@ -106,14 +181,16 @@ def build_cad_model(
     hidden_dim : int
         Hidden size of the ParamHead MLP.
     err_dim : int
-        Size of optional error embedding for ParamHead (0 to disable).
+        Size of optional error embedding for the Transformer conditioning.
+        Must match the dimensionality returned by `compute_error_embedding`
+        (currently 3).
     device : torch.device or str, optional
         If provided, all modules are moved to this device.
 
     Returns
     -------
     ModelComponents
-        A simple dataclass bundling pointnet, transformer, and param_head.
+        A simple dataclass bundling pointnet, transformer, param_head, and token_head.
     """
 
     pointnet = PointNetEncoder(in_dim=3, hidden_dim=gt_dim // 2, out_dim=gt_dim)
@@ -127,19 +204,30 @@ def build_cad_model(
         max_seq_len=max_seq_len,
         dropout=0.1,
         gt_cond_dim=gt_dim,
+        cur_cond_dim=gt_dim,
+        err_cond_dim=err_dim if err_dim > 0 else None,
     )
 
     param_head = ParamHead(
         d_model=d_model,
-        gt_dim=gt_dim,
         vocab_size=vocab_size,
         tok_emb_dim=tok_emb_dim or d_model,
         out_dim=10,           # [cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw]
         hidden_dim=hidden_dim,
-        err_dim=err_dim,
     )
 
-    components = ModelComponents(pointnet=pointnet, transformer=transformer, param_head=param_head)
+    token_head = TokenHead(
+        d_model=d_model,
+        vocab_size=vocab_size,
+        hidden_dim=hidden_dim,
+    )
+
+    components = ModelComponents(
+        pointnet=pointnet,
+        transformer=transformer,
+        param_head=param_head,
+        token_head=token_head,
+    )
     if device is not None:
         components.to(device)
     return components
@@ -148,6 +236,7 @@ def build_cad_model(
 def forward_params_only(
     components: ModelComponents,
     gt_points: torch.Tensor,
+    cur_points: torch.Tensor,
     tokens: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run a forward pass that predicts per-step parameters.
@@ -155,50 +244,67 @@ def forward_params_only(
     This is intended for param pretraining and analysis. It:
 
         1. Encodes GT points with PointNet → gt_embed
-        2. Runs the Transformer with teacher-forced tokens → hidden_states
-        3. Applies the ParamHead at each step → params_pred
-
-    Parameters
-    ----------
-    components : ModelComponents
-        The model bundle from `build_cad_model`.
-    gt_points : FloatTensor [B, N, 3]
-        Ground-truth point clouds.
-    tokens : LongTensor [B, T]
-        Teacher-forced DSL token ids.
-
-    Returns
-    -------
-    params_pred : FloatTensor [B, T, 10]
-        Predicted parameter vectors per step.
-    hidden_states : FloatTensor [B, T, d_model]
-        Transformer hidden states.
-    token_logits : FloatTensor [B, T, vocab_size]
-        Token logits from the Transformer (can be ignored for pure
-        param pretraining, or used for auxiliary losses).
+        2. Encodes current points with the same PointNet → cur_embed
+        3. Computes a richer error embedding from current and GT points.
+        4. Runs the Transformer with teacher-forced tokens and conditioning
+           → hidden_states
+        5. Applies the ParamHead at each step → params_pred
+        6. Applies the TokenHead to all hidden_states → token_logits
     """
 
-    pointnet, transformer, param_head = (
+    pointnet, transformer, param_head, token_head = (
         components.pointnet,
         components.transformer,
         components.param_head,
+        components.token_head,
     )
 
     if gt_points.dim() != 3:
         raise ValueError(f"gt_points must have shape [B, N, 3], got {gt_points.shape}")
+    if cur_points is not None and cur_points.dim() != 3:
+        raise ValueError(f"cur_points must have shape [B, M, 3], got {cur_points.shape}")
     if tokens.dim() != 2:
         raise ValueError(f"tokens must have shape [B, T], got {tokens.shape}")
 
+    # Global embeddings
     gt_embed = pointnet(gt_points)  # [B, gt_dim]
-    hidden_states, token_logits = transformer(tokens, gt_embed=gt_embed)
 
+    B = gt_points.shape[0]
+
+    # Handle possibly empty current point clouds
+    if cur_points is not None and cur_points.shape[1] > 0:
+        # Normal case: encode current mesh and compute error embedding
+        cur_embed = pointnet(cur_points)  # [B, gt_dim]
+        err_embed = compute_error_embedding(gt_points, cur_points)  # [B, 3]
+    else:
+        # Empty or missing current mesh: fall back to zeros
+        cur_embed = torch.zeros_like(gt_embed)
+        err_embed = torch.zeros(
+            B,
+            3,
+            device=gt_points.device,
+            dtype=gt_points.dtype,
+        )
+
+    # Transformer backbone
+    hidden_states = transformer(
+        tokens,
+        gt_embed=gt_embed,
+        cur_embed=cur_embed,
+        err_embed=err_embed,
+    )  # [B, T, d_model]
+
+    # Token logits via TokenHead
+    token_logits = token_head(hidden_states)  # [B, T, vocab_size]
+
+    # Per-step parameter predictions
     B, T, d_model = hidden_states.shape
     params_list = []
 
     for t in range(T):
         h_t = hidden_states[:, t, :]        # [B, d_model]
         tok_t = tokens[:, t]               # [B]
-        params_t = param_head(h_t, gt_embed, tok_t)  # [B, 10]
+        params_t = param_head(h_t, tok_t)  # [B, 10]
         params_list.append(params_t.unsqueeze(1))
 
     params_pred = torch.cat(params_list, dim=1)  # [B, T, 10]
@@ -252,9 +358,10 @@ if __name__ == "__main__":  # pragma: no cover - simple smoke test
 
     B, N, T = 2, 64, 5
     gt_points = torch.randn(B, N, 3)
+    cur_points = gt_points.clone()
     tokens = torch.randint(0, vocab_size, (B, T))
 
-    params_pred, hidden_states, token_logits = forward_params_only(components, gt_points, tokens)
+    params_pred, hidden_states, token_logits = forward_params_only(components, gt_points, cur_points, tokens)
     print("params_pred shape:", params_pred.shape)
 
     # Single-step application demo: randomly choose a primitive-adding token.

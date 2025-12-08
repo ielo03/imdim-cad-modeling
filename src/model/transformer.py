@@ -1,52 +1,51 @@
-"""Transformer backbone for the CAD DSL policy.
 
-This module implements a small, decoder-style Transformer that operates over
-sequences of DSL tokens. It provides:
+"""Transformer backbone for the CAD DSL sequence model.
 
-    - Token embeddings + learned positional embeddings
-    - Optional conditioning on a global GT-geometry embedding (`gt_embed`)
-    - A stack of Transformer encoder layers used in causal (autoregressive) mode
-    - A token head that predicts the next token logits at each position
+`CADTransformer` is a lightweight Transformer encoder that operates over
+DSL token sequences and is conditioned on:
 
-The key thing we care about for parameter pretraining and RL is the hidden
-state `h_t` at each step, which is returned as `hidden_states`.
+    - A global GT shape embedding (from PointNet).
+    - A global current-state embedding (from PointNet).
+    - A global error embedding (from geometry feedback).
+
+The Transformer itself only produces hidden states for each token
+position. Separate heads (e.g. TokenHead, ParamHead) consume these
+hidden states to predict next tokens and primitive parameters.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 
-def _build_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-    """Return an [seq_len, seq_len] causal mask for autoregressive attention.
-
-    mask[i, j] = 0   if j <= i (can attend to self and past)
-    mask[i, j] = -inf if j > i (cannot attend to future)
-    """
-
-    # PyTorch Transformer expects additive mask with -inf for disallowed.
-    # We construct an upper-triangular matrix with -inf above the diagonal.
-    mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
-    mask = torch.triu(mask, diagonal=1)
-    return mask
-
-
 class CADTransformer(nn.Module):
-    """Autoregressive Transformer over DSL token sequences.
+    """Transformer encoder over token sequences with optional conditioning.
 
-    This is a GPT-style encoder-only transformer:
-
-        - Input: token ids [B, T]
-        - Optional conditioning on GT geometry via `gt_embed` [B, H_gt]
-        - Output:
-            hidden_states: [B, T, d_model]
-            token_logits:  [B, T, vocab_size]
-
-    The hidden states are consumed by the parameter head. The token logits are
-    used for the token policy (RL) or teacher forcing during pretraining.
+    Parameters
+    ----------
+    vocab_size : int
+        Size of the DSL token vocabulary.
+    d_model : int
+        Hidden size of the Transformer.
+    n_heads : int
+        Number of attention heads.
+    num_layers : int
+        Number of Transformer encoder layers.
+    dim_feedforward : int
+        Hidden size of the feedforward layers inside Transformer blocks.
+    max_seq_len : int
+        Maximum supported sequence length.
+    dropout : float
+        Dropout probability.
+    gt_cond_dim : int, optional
+        Dimensionality of GT embedding used for conditioning (None to disable).
+    cur_cond_dim : int, optional
+        Dimensionality of current-state embedding for conditioning.
+    err_cond_dim : int, optional
+        Dimensionality of error embedding for conditioning.
     """
 
     def __init__(
@@ -59,6 +58,8 @@ class CADTransformer(nn.Module):
         max_seq_len: int = 64,
         dropout: float = 0.1,
         gt_cond_dim: Optional[int] = None,
+        cur_cond_dim: Optional[int] = None,
+        err_cond_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -70,97 +71,114 @@ class CADTransformer(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
 
-        # Optional linear projection for GT conditioning
-        self.gt_cond_dim = gt_cond_dim
-        if gt_cond_dim is not None:
-            self.gt_proj = nn.Linear(gt_cond_dim, d_model)
-        else:
-            self.gt_proj = None
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True,
+            batch_first=False,  # [T, B, D]
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.token_head = nn.Linear(d_model, vocab_size)
+        # Conditioning projections
+        self.gt_proj = nn.Linear(gt_cond_dim, d_model) if gt_cond_dim is not None else None
+        self.cur_proj = nn.Linear(cur_cond_dim, d_model) if cur_cond_dim is not None else None
+        self.err_proj = nn.Linear(err_cond_dim, d_model) if err_cond_dim is not None else None
+
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
         tokens: torch.Tensor,
         gt_embed: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
+        cur_embed: Optional[torch.Tensor] = None,
+        err_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass through the Transformer.
 
         Parameters
         ----------
-        tokens : LongTensor of shape [B, T]
-            Sequence of DSL token ids.
-        gt_embed : FloatTensor of shape [B, H_gt], optional
-            Global GT-geometry embedding (e.g., from PointNet). If provided
-            and `gt_cond_dim` is set, this is projected and added to all
-            token embeddings.
+        tokens : LongTensor [B, T]
+            Input DSL token ids (teacher-forced history).
+        gt_embed : FloatTensor [B, H_gt], optional
+            Global GT shape embedding.
+        cur_embed : FloatTensor [B, H_cur], optional
+            Global current-state embedding.
+        err_embed : FloatTensor [B, H_err], optional
+            Global error embedding.
 
         Returns
         -------
         hidden_states : FloatTensor [B, T, d_model]
-        token_logits  : FloatTensor [B, T, vocab_size]
+            Transformer hidden states for each position.
         """
-
         if tokens.dim() != 2:
             raise ValueError(f"tokens must have shape [B, T], got {tokens.shape}")
-
         B, T = tokens.shape
-        device = tokens.device
-
         if T > self.max_seq_len:
-            raise ValueError(
-                f"Sequence length {T} exceeds max_seq_len={self.max_seq_len}. "
-                f"Increase max_seq_len when constructing CADTransformer."
-            )
+            raise ValueError(f"Sequence length T={T} exceeds max_seq_len={self.max_seq_len}")
 
-        # Token + positional embeddings
-        tok_emb = self.token_embedding(tokens)  # [B, T, d_model]
+        device = tokens.device
         pos_ids = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
-        pos_emb = self.pos_embedding(pos_ids)  # [1, T, d_model]
-        x = tok_emb + pos_emb
 
-        # Optional GT conditioning: add a broadcasted projection
+        x = self.token_embedding(tokens) + self.pos_embedding(pos_ids)  # [B, T, d_model]
+
+        # Conditioning: add broadcast projections
         if self.gt_proj is not None and gt_embed is not None:
-            if gt_embed.dim() != 2:
+            if gt_embed.dim() != 2 or gt_embed.shape[0] != B:
                 raise ValueError(
-                    f"gt_embed must have shape [B, H_gt], got {gt_embed.shape}"
+                    f"gt_embed must be [B, H_gt] with B={B}, got {gt_embed.shape}"
                 )
-            if gt_embed.shape[0] != B:
+            gcond = self.gt_proj(gt_embed).unsqueeze(1)  # [B, 1, d_model]
+            x = x + gcond
+
+        if self.cur_proj is not None and cur_embed is not None:
+            if cur_embed.dim() != 2 or cur_embed.shape[0] != B:
                 raise ValueError(
-                    f"Batch size mismatch between tokens (B={B}) and gt_embed "
-                    f"(B={gt_embed.shape[0]})"
+                    f"cur_embed must be [B, H_cur] with B={B}, got {cur_embed.shape}"
                 )
-            cond = self.gt_proj(gt_embed)  # [B, d_model]
-            cond = cond.unsqueeze(1)  # [B, 1, d_model]
-            x = x + cond
+            ccond = self.cur_proj(cur_embed).unsqueeze(1)  # [B, 1, d_model]
+            x = x + ccond
 
-        # Causal mask so position t cannot attend to > t
-        causal_mask = _build_causal_mask(T, device=device)
+        if self.err_proj is not None and err_embed is not None:
+            if err_embed.dim() != 2 or err_embed.shape[0] != B:
+                raise ValueError(
+                    f"err_embed must be [B, H_err] with B={B}, got {err_embed.shape}"
+                )
+            econd = self.err_proj(err_embed).unsqueeze(1)  # [B, 1, d_model]
+            x = x + econd
 
-        hidden_states = self.transformer(x, mask=causal_mask)  # [B, T, d_model]
-        token_logits = self.token_head(hidden_states)  # [B, T, vocab_size]
+        x = self.dropout(x)
 
-        return hidden_states, token_logits
+        # TransformerEncoder expects [T, B, D]
+        x_tbd = x.transpose(0, 1)  # [T, B, D]
+        h_tbd = self.encoder(x_tbd)  # [T, B, D]
+        hidden_states = h_tbd.transpose(0, 1)  # [B, T, D]
+
+        return hidden_states
 
 
 if __name__ == "__main__":  # pragma: no cover - simple smoke test
-    # Minimal smoke test: random tokens through the transformer
     vocab_size = 16
-    model = CADTransformer(vocab_size=vocab_size, d_model=64, n_heads=4, num_layers=2)
-
+    d_model = 64
     B, T = 2, 5
+
+    model = CADTransformer(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_heads=4,
+        num_layers=2,
+        dim_feedforward=128,
+        max_seq_len=16,
+        gt_cond_dim=32,
+        cur_cond_dim=32,
+        err_cond_dim=3,
+    )
+
     tokens = torch.randint(0, vocab_size, (B, T))
     gt_embed = torch.randn(B, 32)
+    cur_embed = torch.randn(B, 32)
+    err_embed = torch.randn(B, 3)
 
-    hidden, logits = model(tokens, gt_embed=None)
+    hidden = model(tokens, gt_embed=gt_embed, cur_embed=cur_embed, err_embed=err_embed)
     print("hidden shape:", hidden.shape)
-    print("logits shape:", logits.shape)

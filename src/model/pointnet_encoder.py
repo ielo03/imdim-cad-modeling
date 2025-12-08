@@ -1,127 +1,84 @@
+"""PointNet-style encoder for 3D point clouds.
 
+This module provides a simple PointNet-like encoder that maps an input
+point cloud of shape [B, N, 3] to a global embedding of shape [B, out_dim].
 
-"""PointNet-style encoder for GT point clouds.
-
-This module encodes a set of 3D points (e.g., sampled from a ground-truth
-mesh) into a single fixed-size embedding vector. It is intentionally minimal:
-
-    - Per-point MLP (shared across points)
-    - Global max or mean pooling
-
-Shape conventions:
-
-    points: [B, N, 3]
-    output: [B, out_dim]
-
-This encoder is used to produce `gt_embed` for conditioning the Transformer
-(backbone) and the parameter MLP.
+The encoder is intentionally lightweight: a stack of pointwise MLPs
+implemented as 1x1 convolutions followed by a symmetric max-pool over
+points. This embedding is then used as conditioning for the CAD
+Transformer backbone.
 """
 
 from __future__ import annotations
-
-from typing import Literal
 
 import torch
 import torch.nn as nn
 
 
 class PointNetEncoder(nn.Module):
-    """Minimal PointNet-style point cloud encoder.
+    """Minimal PointNet-style encoder.
 
     Parameters
     ----------
     in_dim : int
-        Dimensionality of each point (3 for xyz).
+        Input feature dimension per point (3 for xyz).
     hidden_dim : int
-        Hidden size of per-point MLP layers.
+        Hidden size for intermediate layers.
     out_dim : int
-        Output embedding dimensionality.
-    num_layers : int
-        Number of linear layers in the per-point MLP (>= 2).
-    activation : callable
-        Nonlinearity to use between layers (default: ReLU).
-    pool : {"max", "mean"}
-        Global pooling type over the point dimension.
+        Output embedding dimension.
     """
 
     def __init__(
         self,
         in_dim: int = 3,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         out_dim: int = 256,
-        num_layers: int = 3,
-        activation: nn.Module | None = None,
-        pool: Literal["max", "mean"] = "max",
     ) -> None:
         super().__init__()
-
-        if num_layers < 2:
-            raise ValueError("PointNetEncoder requires num_layers >= 2")
 
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
-        self.pool = pool
 
-        if activation is None:
-            activation = nn.ReLU()
-        self.activation = activation
-
-        layers = []
-        # First layer: in_dim -> hidden_dim
-        layers.append(nn.Linear(in_dim, hidden_dim))
-        layers.append(self.activation)
-
-        # Middle layers: hidden_dim -> hidden_dim
-        for _ in range(num_layers - 2):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(self.activation)
-
-        # Final layer: hidden_dim -> out_dim
-        layers.append(nn.Linear(hidden_dim, out_dim))
-
-        self.mlp = nn.Sequential(*layers)
+        # Pointwise MLP via 1x1 convolutions: [B, in_dim, N] -> [B, out_dim, N]
+        self.mlp = nn.Sequential(
+            nn.Conv1d(in_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim * 2, out_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, points: torch.Tensor) -> torch.Tensor:
         """Encode a batch of point clouds.
 
         Parameters
         ----------
-        points : FloatTensor of shape [B, N, in_dim]
-            Batch of point sets.
+        points : FloatTensor [B, N, in_dim]
+            Input point clouds.
 
         Returns
         -------
-        gt_embed : FloatTensor of shape [B, out_dim]
-            Global embedding for each point cloud.
+        embed : FloatTensor [B, out_dim]
+            Global embedding per point cloud.
         """
-
         if points.dim() != 3:
             raise ValueError(f"points must have shape [B, N, C], got {points.shape}")
         B, N, C = points.shape
         if C != self.in_dim:
-            raise ValueError(
-                f"Expected last dim in points to be {self.in_dim}, got {C}"
-            )
+            raise ValueError(f"Expected in_dim={self.in_dim}, got {C}")
 
-        # Flatten points to [B * N, C] for shared MLP
-        pts_flat = points.view(B * N, C)
-        feats = self.mlp(pts_flat)  # [B * N, out_dim]
-        feats = feats.view(B, N, self.out_dim)
-
-        if self.pool == "max":
-            gt_embed, _ = feats.max(dim=1)  # [B, out_dim]
-        elif self.pool == "mean":
-            gt_embed = feats.mean(dim=1)
-        else:
-            raise ValueError(f"Unknown pool type: {self.pool!r}")
-
-        return gt_embed
+        # [B, N, C] -> [B, C, N]
+        x = points.transpose(1, 2)
+        x = self.mlp(x)             # [B, out_dim, N]
+        x = torch.max(x, dim=2)[0]  # [B, out_dim] global max-pool
+        return x
 
 
 if __name__ == "__main__":  # pragma: no cover - simple smoke test
-    encoder = PointNetEncoder(in_dim=3, hidden_dim=64, out_dim=128, num_layers=3)
     B, N = 4, 256
+    encoder = PointNetEncoder(in_dim=3, hidden_dim=64, out_dim=128)
     pts = torch.randn(B, N, 3)
     emb = encoder(pts)
     print("points shape:", pts.shape)
