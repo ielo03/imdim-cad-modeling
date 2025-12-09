@@ -310,6 +310,13 @@ def main() -> None:
             except Exception:
                 gt_name = f"<unknown:{gt_ids[0]}>"
             print(f"GT first token name : {gt_name}")
+
+            # Ground-truth next params, if available
+            if "next_params" in data.files:
+                gt_next_params = data["next_params"].astype(np.float32)
+                print(f"GT next params [10]: {gt_next_params.reshape(-1)}")
+            else:
+                print("GT next_params not found in sample.")
         else:
             print("GT next_tokens not found in sample.")
 
