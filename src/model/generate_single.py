@@ -296,7 +296,7 @@ def main() -> None:
         print("\n=== Prediction ===")
         print(f"Next token id   : {token_int}")
         print(f"Next token name : {token_name}")
-        print(f"Next params [10]: {next_params.numpy().reshape(-1)}")
+        print(f"Next params [10]: {next_params.numpy().tolist()}")
 
         # Ground-truth next token(s), if available
         if gt_next_tokens is not None:
@@ -314,7 +314,7 @@ def main() -> None:
             # Ground-truth next params, if available
             if "next_params" in data.files:
                 gt_next_params = data["next_params"].astype(np.float32)
-                print(f"GT next params [10]: {gt_next_params.reshape(-1)}")
+                print(f"GT next params [10]: {gt_next_params}")
             else:
                 print("GT next_params not found in sample.")
         else:

@@ -136,6 +136,7 @@ class NPZCADDataset(Dataset):
             "cur_points": cur_points,    # [M,3]
             "gt_tokens": gt_tokens_t,    # [T]
             "gt_params": gt_params_t,    # [T,10]
+            "hist_len": torch.tensor(hist_tokens.shape[0], dtype=torch.long),
         }
 
 
@@ -210,12 +211,14 @@ def cad_collate(
     cur_points_list = []
     gt_tokens_list = []
     gt_params_list = []
+    hist_len_list = []
 
     for item in batch:
         gp = item["gt_points"]  # [N,3]
         cp = item["cur_points"]  # [M,3]
         gt_tokens = item["gt_tokens"]  # [T]
         gt_params = item["gt_params"]  # [T,10]
+        hist_len = item["hist_len"]
 
         # Ensure tensors are on CPU here; they will be moved to device later.
         if gp.device.type != "cpu":
@@ -230,10 +233,12 @@ def cad_collate(
         cur_points_list.append(cp_fixed)
         gt_tokens_list.append(gt_tokens)
         gt_params_list.append(gt_params)
+        hist_len_list.append(hist_len)
 
     # Stack point clouds: [B, N_fixed, 3]
     gt_points = torch.stack(gt_points_list, dim=0)
     cur_points = torch.stack(cur_points_list, dim=0)
+    hist_len = torch.stack(hist_len_list, dim=0)  # [B]
 
     # Check and stack tokens/params. We assume equal T across the batch.
     T = gt_tokens_list[0].shape[0]
@@ -257,6 +262,7 @@ def cad_collate(
         "cur_points": cur_points,
         "gt_tokens": gt_tokens,
         "gt_params": gt_params,
+        "hist_len": hist_len,
     }
 
 
@@ -286,27 +292,30 @@ def build_dataloader(
     )
 
 
+
 def compute_param_mse_loss(
     params_pred: torch.Tensor,
     gt_params: torch.Tensor,
-    tokens: torch.Tensor,
+    scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute MSE over params, masking to primitive-adding tokens only.
+    """Compute MSE over 10D parameters for the immediate-next step.
 
     Parameters
     ----------
-    params_pred : FloatTensor [B, T, 10]
-        Predicted parameter vectors.
-    gt_params : FloatTensor [B, T, 10]
-        Ground-truth parameter vectors.
-    tokens : LongTensor [B, T]
-        Token ids per step.
+    params_pred : FloatTensor [B, 10]
+        Predicted parameter vectors for the supervised step.
+    gt_params : FloatTensor [B, 10]
+        Ground-truth parameter vectors for the supervised step.
+    scales : Optional FloatTensor [10]
+        Per-dimension scale factors for normalization. If provided,
+        we compute MSE on (params_pred - gt_params) / scales, with
+        tiny scales clamped to 1.0 to avoid exploding loss on
+        zero-variance dimensions.
 
     Returns
     -------
     loss : scalar Tensor
-        Mean squared error over primitive steps. If no primitives are
-        present in the batch, returns zero.
+        Mean squared error over batch and dimensions.
     """
 
     if params_pred.shape != gt_params.shape:
@@ -315,79 +324,88 @@ def compute_param_mse_loss(
             f"{params_pred.shape} vs {gt_params.shape}"
         )
 
-    B, T, D = params_pred.shape
-    if D != 10:
-        raise ValueError(f"Expected last dim=10, got {D}")
+    if params_pred.dim() != 2 or params_pred.shape[1] != 10:
+        raise ValueError(f"Expected params_pred shape [B, 10], got {params_pred.shape}")
 
-    # Mask to primitive-adding tokens only
-    primitive_ids = torch.tensor(
-        [
-            Token.ADD_BOX.value,
-            Token.ADD_SPHERE.value,
-            Token.ADD_CYLINDER.value,
-        ],
-        device=tokens.device,
-    )
+    if scales is not None:
+        s = scales.to(params_pred.device).view(1, -1)  # [1, 10]
+        # Clamp very small scales to 1.0 to avoid blowing up zero-variance dims
+        s = torch.clamp(s, min=1e-6)
+        diff = (params_pred - gt_params) / s
+    else:
+        diff = params_pred - gt_params
 
-    # tokens: [B, T]
-    # primitive_mask: [B, T]
-    primitive_mask = (tokens.unsqueeze(-1) == primitive_ids.unsqueeze(0).unsqueeze(0)).any(dim=-1)
+    return (diff ** 2).mean()
 
-    if not primitive_mask.any():
-        # No primitives in this batch; return zero to avoid NaNs
-        return torch.zeros((), device=params_pred.device, dtype=params_pred.dtype)
-
-    # Select only primitive steps
-    pred_prim = params_pred[primitive_mask]  # [K, 10]
-    gt_prim = gt_params[primitive_mask]      # [K, 10]
-
-    loss = nn.functional.mse_loss(pred_prim, gt_prim)
-    return loss
 
 
 
 # ---------------------------------------------------------------------------
-# Token cross-entropy loss helper
+# Token cross-entropy loss helper (immediate-next)
 # ---------------------------------------------------------------------------
 
 def compute_token_ce_loss(
     token_logits: torch.Tensor,
     tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute cross-entropy loss over tokens.
+    """Compute cross-entropy loss over the immediate-next token.
 
     Parameters
     ----------
-    token_logits : FloatTensor [B, T, V]
-        Predicted logits over the DSL vocabulary.
-    tokens : LongTensor [B, T]
-        Ground-truth token ids.
+    token_logits : FloatTensor [B, V]
+        Predicted logits over the DSL vocabulary for the supervised step.
+    tokens : LongTensor [B]
+        Ground-truth token ids for the supervised step.
 
     Returns
     -------
     loss : scalar Tensor
-        Mean cross-entropy over all positions in the batch.
+        Mean cross-entropy over the batch.
     """
 
-    if token_logits.dim() != 3:
+    if token_logits.dim() != 2:
         raise ValueError(
-            f"token_logits must have shape [B, T, V], got {token_logits.shape}"
+            f"token_logits must have shape [B, V], got {token_logits.shape}"
         )
-    if tokens.dim() != 2:
-        raise ValueError(f"tokens must have shape [B, T], got {tokens.shape}")
+    if tokens.dim() != 1:
+        raise ValueError(f"tokens must have shape [B], got {tokens.shape}")
 
-    B, T, V = token_logits.shape
-    if tokens.shape[0] != B or tokens.shape[1] != T:
+    B, V = token_logits.shape
+    if tokens.shape[0] != B:
         raise ValueError(
             f"Shape mismatch between token_logits {token_logits.shape} and tokens {tokens.shape}"
         )
 
-    # Flatten batch + time
-    logits_flat = token_logits.reshape(B * T, V)   # [B*T, V]
-    targets_flat = tokens.reshape(B * T)           # [B*T]
+    return nn.functional.cross_entropy(token_logits, tokens)
+# ---------------------------------------------------------------------------
+# Helper to load per-dimension parameter scales
+# ---------------------------------------------------------------------------
 
-    loss = nn.functional.cross_entropy(logits_flat, targets_flat)
-    return loss
+def load_param_scales(path: str) -> torch.Tensor:
+    """Load per-dimension parameter scales from a .npy or .npz file.
+
+    The file is expected to contain either:
+        - a plain 1D array of length 10, or
+        - an npz with an array named 'scales' of length 10.
+
+    Returns a FloatTensor [10].
+    """
+    arr = np.load(path)
+    if isinstance(arr, np.lib.npyio.NpzFile):
+        if "scales" in arr.files:
+            arr = arr["scales"]
+        else:
+            # Fallback: take the first array in the npz
+            first_key = arr.files[0]
+            arr = arr[first_key]
+
+    arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+    if arr.shape[0] != 10:
+        raise ValueError(
+            f"Expected 10 parameter scales, got shape {arr.shape} from {path}"
+        )
+    return torch.from_numpy(arr)
+
 
 
 def train_epoch(
@@ -396,6 +414,9 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
+    param_scales: torch.Tensor | None,
+    param_weight: float,
+    token_weight: float,
 ) -> float:
     """Run a single training epoch and return average loss."""
 
@@ -417,19 +438,35 @@ def train_epoch(
         cur_points = batch["cur_points"].to(device) # [B, M, 3] (unused for now)
         gt_tokens = batch["gt_tokens"].to(device)   # [B, T]
         gt_params = batch["gt_params"].to(device)   # [B, T, 10]
+        hist_len = batch["hist_len"].to(device)     # [B]
 
-        params_pred, hidden_states, token_logits = forward_params_only(
+        params_pred_seq, hidden_states, token_logits_seq = forward_params_only(
             components, gt_points, cur_points, gt_tokens
-        )
+        )  # params_pred_seq: [B, T, 10], token_logits_seq: [B, T, V]
 
-        # Parameter regression loss (masked to primitive-adding tokens)
-        param_loss = compute_param_mse_loss(params_pred, gt_params, gt_tokens)
+        B, T, D = params_pred_seq.shape
+        if D != 10:
+            raise ValueError(f"Expected params_pred_seq last dim=10, got {D}")
 
-        # Token prediction loss (auxiliary)
-        token_loss = compute_token_ce_loss(token_logits, gt_tokens)
+        # Supervision index: the first element in "next", i.e. the first step after history
+        # For each sample b, index = hist_len[b], clamped to [0, T-1] for safety.
+        batch_indices = torch.arange(B, device=device)
+        next_indices = torch.clamp(hist_len, min=0, max=T - 1)
 
-        # Total loss: simple sum for now (can reweight later)
-        loss = param_loss + token_loss
+        params_pred_next = params_pred_seq[batch_indices, next_indices, :]  # [B, 10]
+        gt_params_next = gt_params[batch_indices, next_indices, :]          # [B, 10]
+
+        token_logits_next = token_logits_seq[batch_indices, next_indices, :]  # [B, V]
+        gt_tokens_next = gt_tokens[batch_indices, next_indices]               # [B]
+
+        # Parameter regression loss on normalized params (if scales are provided)
+        param_loss = compute_param_mse_loss(params_pred_next, gt_params_next, param_scales)
+
+        # Token prediction loss (auxiliary) on the immediate-next token
+        token_loss = compute_token_ce_loss(token_logits_next, gt_tokens_next)
+
+        # Total loss with configurable weights
+        loss = param_weight * param_loss + token_weight * token_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -462,11 +499,15 @@ def train_epoch(
     return avg_loss
 
 
+
 def eval_epoch(
     components,
     dataloader: DataLoader,
     device: torch.device,
     epoch: int,
+    param_scales: torch.Tensor | None,
+    param_weight: float,
+    token_weight: float,
 ) -> float:
     """Run a validation epoch and return average loss.
 
@@ -490,14 +531,28 @@ def eval_epoch(
             cur_points = batch["cur_points"].to(device) # [B, M, 3]
             gt_tokens = batch["gt_tokens"].to(device)   # [B, T]
             gt_params = batch["gt_params"].to(device)   # [B, T, 10]
+            hist_len = batch["hist_len"].to(device)     # [B]
 
-            params_pred, hidden_states, token_logits = forward_params_only(
+            params_pred_seq, hidden_states, token_logits_seq = forward_params_only(
                 components, gt_points, cur_points, gt_tokens
             )
 
-            param_loss = compute_param_mse_loss(params_pred, gt_params, gt_tokens)
-            token_loss = compute_token_ce_loss(token_logits, gt_tokens)
-            loss = param_loss + token_loss
+            B, T, D = params_pred_seq.shape
+            if D != 10:
+                raise ValueError(f"Expected params_pred_seq last dim=10, got {D}")
+
+            batch_indices = torch.arange(B, device=device)
+            next_indices = torch.clamp(hist_len, min=0, max=T - 1)
+
+            params_pred_next = params_pred_seq[batch_indices, next_indices, :]  # [B, 10]
+            gt_params_next = gt_params[batch_indices, next_indices, :]          # [B, 10]
+
+            token_logits_next = token_logits_seq[batch_indices, next_indices, :]  # [B, V]
+            gt_tokens_next = gt_tokens[batch_indices, next_indices]               # [B]
+
+            param_loss = compute_param_mse_loss(params_pred_next, gt_params_next, param_scales)
+            token_loss = compute_token_ce_loss(token_logits_next, gt_tokens_next)
+            loss = param_weight * param_loss + token_weight * token_loss
 
             total_loss += loss.item()
             total_param_loss += param_loss.item()
@@ -543,6 +598,24 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Maximum token sequence length for the transformer",
     )
+    parser.add_argument(
+        "--param_weight",
+        type=float,
+        default=1.0,
+        help="Weight for parameter MSE in the total loss",
+    )
+    parser.add_argument(
+        "--token_weight",
+        type=float,
+        default=1.0,
+        help="Weight for token cross-entropy in the total loss",
+    )
+    parser.add_argument(
+        "--param_scale_path",
+        type=str,
+        default=None,
+        help="Optional path to .npy/.npz with per-dimension param scales (length 10)",
+    )
     return parser.parse_args()
 
 
@@ -586,6 +659,11 @@ def main() -> None:
             data_root=args.val_root,
         )
 
+    # Load param scales if provided
+    param_scales = None
+    if args.param_scale_path is not None:
+        param_scales = load_param_scales(args.param_scale_path).to(device)
+
     # Best-model tracking
     best_val_loss = float("inf")
     models_dir = _SRC_ROOT.parent / "models"
@@ -593,11 +671,28 @@ def main() -> None:
     best_path = models_dir / "best.pt"
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(components, dataloader, optimizer, device, epoch)
+        train_loss = train_epoch(
+            components,
+            dataloader,
+            optimizer,
+            device,
+            epoch,
+            param_scales,
+            args.param_weight,
+            args.token_weight,
+        )
 
         val_loss = None
         if val_dataloader is not None:
-            val_loss = eval_epoch(components, val_dataloader, device, epoch)
+            val_loss = eval_epoch(
+                components,
+                val_dataloader,
+                device,
+                epoch,
+                param_scales,
+                args.param_weight,
+                args.token_weight,
+            )
 
             # Update and save best model
             if val_loss < best_val_loss:
