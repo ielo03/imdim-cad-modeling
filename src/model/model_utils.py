@@ -47,6 +47,9 @@ from model.token_head import TokenHead
 from state_machine import ShapeState, Token
 
 
+ERR_EMBED_DIM = 8
+
+
 @dataclass
 class ModelComponents:
     """Bundle of core model components for the CAD policy.
@@ -86,14 +89,19 @@ def compute_error_embedding(
 ) -> torch.Tensor:
     """Compute a richer error embedding from GT and current point clouds.
 
-    We include three scalars per batch element:
+    The embedding has ERR_EMBED_DIM=8 scalars per batch element:
 
-        1. Symmetric Chamfer distance between cur and GT clouds.
-        2. L2 distance between centroids of cur and GT.
-        3. Log scale ratio of bounding-box diagonals (cur / GT).
+        0: Symmetric Chamfer distance between cur and GT clouds.
+        1: L2 distance between centroids of cur and GT.
+        2: Mean per-point L2 error (aligned subset).
+        3: Max per-point L2 error (aligned subset).
+        4: Std per-point L2 error (aligned subset).
+        5: Scale ratio (cur / GT) based on average radius.
+        6: GT average radius.
+        7: CUR average radius.
 
-    This yields a [B, 3] error embedding that can be projected inside
-    the Transformer.
+    Inputs are expected to be [B, N, 3] and [B, M, 3]. If either cloud has
+    zero points, a zero embedding is returned for that batch.
     """
 
     if gt_points.dim() != 3 or cur_points.dim() != 3:
@@ -105,22 +113,19 @@ def compute_error_embedding(
     B = gt_points.shape[0]
 
     # If either cloud has zero points, return a zero error embedding.
-    # This avoids crashes in Chamfer / centroid / bbox ops and gives
-    # the model a consistent "no-geometry" signal.
     if gt_points.shape[1] == 0 or cur_points.shape[1] == 0:
         return torch.zeros(
             B,
-            3,
+            ERR_EMBED_DIM,
             device=gt_points.device,
             dtype=gt_points.dtype,
         )
 
-    # 1) Chamfer distance (no grad through geometry backend)
+    # 1) Chamfer distance (no grad through geometry backend).
     # chamfer_distance expects rank-2 [N,3] tensors, so compute it per batch element.
     with torch.no_grad():
         chamf_list = []
         for b in range(B):
-            # Each call takes [N_b, 3] and [M_b, 3]
             chamf_b = chamfer_distance(cur_points[b], gt_points[b])
             if not isinstance(chamf_b, torch.Tensor):
                 chamf_b = torch.as_tensor(
@@ -128,9 +133,7 @@ def compute_error_embedding(
                     device=gt_points.device,
                     dtype=gt_points.dtype,
                 )
-            # Ensure scalar tensor, then collect
             chamf_list.append(chamf_b.reshape(1))
-
         chamf = torch.cat(chamf_list, dim=0)  # [B]
 
     # 2) Centroid distance
@@ -138,18 +141,42 @@ def compute_error_embedding(
     centroid_cur = cur_points.mean(dim=1) # [B, 3]
     centroid_dist = torch.linalg.norm(centroid_gt - centroid_cur, dim=-1)  # [B]
 
-    # 3) Bounding-box scale ratio (log of diagonal length ratio)
+    # 3) Per-point errors on aligned subset (min(N_gt, N_cur))
+    Ng = gt_points.shape[1]
+    Nc = cur_points.shape[1]
+    N = min(Ng, Nc)
+    gt_sub = gt_points[:, :N, :]   # [B, N, 3]
+    cur_sub = cur_points[:, :N, :] # [B, N, 3]
+    point_dists = torch.linalg.norm(cur_sub - gt_sub, dim=-1)  # [B, N]
+
+    mean_point_err = point_dists.mean(dim=1)      # [B]
+    max_point_err = point_dists.max(dim=1).values # [B]
+    std_point_err = point_dists.std(dim=1)        # [B]
+
+    # 4) Scale via average radius from centroid for each cloud
+    gt_centered = gt_points - centroid_gt.unsqueeze(1)   # [B, N_gt, 3]
+    cur_centered = cur_points - centroid_cur.unsqueeze(1) # [B, N_cur, 3]
+
+    gt_radius = torch.sqrt((gt_centered ** 2).sum(dim=-1)).mean(dim=1)  # [B]
+    cur_radius = torch.sqrt((cur_centered ** 2).sum(dim=-1)).mean(dim=1)  # [B]
+
     eps = 1e-6
-    gt_min, _ = gt_points.min(dim=1)
-    gt_max, _ = gt_points.max(dim=1)
-    cur_min, _ = cur_points.min(dim=1)
-    cur_max, _ = cur_points.max(dim=1)
+    scale_ratio = cur_radius / (gt_radius + eps)  # [B]
 
-    gt_diag = torch.linalg.norm(gt_max - gt_min, dim=-1).clamp_min(eps)  # [B]
-    cur_diag = torch.linalg.norm(cur_max - cur_min, dim=-1).clamp_min(eps)  # [B]
-    scale_ratio = torch.log((cur_diag / gt_diag).clamp_min(eps))  # [B]
-
-    err_embed = torch.stack([chamf, centroid_dist, scale_ratio], dim=-1)  # [B, 3]
+    # Stack into [B, ERR_EMBED_DIM]
+    err_embed = torch.stack(
+        [
+            chamf,
+            centroid_dist,
+            mean_point_err,
+            max_point_err,
+            std_point_err,
+            scale_ratio,
+            gt_radius,
+            cur_radius,
+        ],
+        dim=-1,
+    )
     return err_embed
 
 
@@ -158,11 +185,11 @@ def build_cad_model(
     gt_dim: int = 256,
     d_model: int = 256,
     n_heads: int = 4,
-    num_layers: int = 4,
+    num_layers: int = 6,
     max_seq_len: int = 64,
     tok_emb_dim: Optional[int] = None,
     hidden_dim: int = 256,
-    err_dim: int = 3,
+    err_dim: int = ERR_EMBED_DIM,
     device: Optional[torch.device | str] = None,
 ) -> ModelComponents:
     """Construct a consistent set of model components for the CAD task.
@@ -206,7 +233,7 @@ def build_cad_model(
         d_model=d_model,
         n_heads=n_heads,
         num_layers=num_layers,
-        dim_feedforward=2 * d_model,
+        dim_feedforward=4 * d_model,
         max_seq_len=max_seq_len,
         dropout=0.1,
         gt_cond_dim=gt_dim,
@@ -281,13 +308,13 @@ def forward_params_only(
     if cur_points is not None and cur_points.shape[1] > 0:
         # Normal case: encode current mesh and compute error embedding
         cur_embed = pointnet(cur_points)  # [B, gt_dim]
-        err_embed = compute_error_embedding(gt_points, cur_points)  # [B, 3]
+        err_embed = compute_error_embedding(gt_points, cur_points)  # [B, ERR_EMBED_DIM]
     else:
         # Empty or missing current mesh: fall back to zeros
         cur_embed = torch.zeros_like(gt_embed)
         err_embed = torch.zeros(
             B,
-            3,
+            ERR_EMBED_DIM,
             device=gt_points.device,
             dtype=gt_points.dtype,
         )

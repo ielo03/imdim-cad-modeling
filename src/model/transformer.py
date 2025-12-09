@@ -1,4 +1,3 @@
-
 """Transformer backbone for the CAD DSL sequence model.
 
 `CADTransformer` is a lightweight Transformer encoder that operates over
@@ -53,8 +52,8 @@ class CADTransformer(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         n_heads: int = 4,
-        num_layers: int = 4,
-        dim_feedforward: int = 512,
+        num_layers: int = 6,
+        dim_feedforward: int = 1024,
         max_seq_len: int = 64,
         dropout: float = 0.1,
         gt_cond_dim: Optional[int] = None,
@@ -83,7 +82,11 @@ class CADTransformer(nn.Module):
         # Conditioning projections
         self.gt_proj = nn.Linear(gt_cond_dim, d_model) if gt_cond_dim is not None else None
         self.cur_proj = nn.Linear(cur_cond_dim, d_model) if cur_cond_dim is not None else None
-        self.err_proj = nn.Linear(err_cond_dim, d_model) if err_cond_dim is not None else None
+        self.err_proj = (
+            nn.Linear(err_cond_dim, d_model)
+            if (err_cond_dim is not None and err_cond_dim > 0)
+            else None
+        )
 
         self.dropout = nn.Dropout(dropout)
 
@@ -145,6 +148,12 @@ class CADTransformer(nn.Module):
                 raise ValueError(
                     f"err_embed must be [B, H_err] with B={B}, got {err_embed.shape}"
                 )
+            in_features = self.err_proj.in_features
+            if err_embed.shape[1] != in_features:
+                raise ValueError(
+                    f"err_embed last dim {err_embed.shape[1]} does not match "
+                    f"err_proj in_features={in_features}"
+                )
             econd = self.err_proj(err_embed).unsqueeze(1)  # [B, 1, d_model]
             x = x + econd
 
@@ -169,13 +178,13 @@ if __name__ == "__main__":  # pragma: no cover - simple smoke test
         max_seq_len=16,
         gt_cond_dim=32,
         cur_cond_dim=32,
-        err_cond_dim=3,
+        err_cond_dim=8,
     )
 
     tokens = torch.randint(0, vocab_size, (B, T))
     gt_embed = torch.randn(B, 32)
     cur_embed = torch.randn(B, 32)
-    err_embed = torch.randn(B, 3)
+    err_embed = torch.randn(B, 8)
 
     hidden = model(tokens, gt_embed=gt_embed, cur_embed=cur_embed, err_embed=err_embed)
     print("hidden shape:", hidden.shape)

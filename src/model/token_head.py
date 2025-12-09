@@ -1,11 +1,3 @@
-
-
-"""Token head for predicting the next DSL token.
-
-Given Transformer hidden states of shape [B, T, d_model], this module
-produces logits over the token vocabulary at each position.
-"""
-
 from __future__ import annotations
 
 import torch

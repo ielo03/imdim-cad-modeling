@@ -51,7 +51,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from state_machine import Token  # type: ignore
-from model.model_utils import build_cad_model, forward_params_only
+from model.model_utils import build_cad_model, forward_params_only, ERR_EMBED_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +599,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum token sequence length for the transformer",
     )
     parser.add_argument(
+        "--gt_dim",
+        type=int,
+        default=128,
+        help="PointNet embedding dimension for point clouds",
+    )
+    parser.add_argument(
+        "--d_model",
+        type=int,
+        default=256,
+        help="Transformer hidden size (model dimension)",
+    )
+    parser.add_argument(
+        "--n_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in the transformer",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=6,
+        help="Number of transformer encoder layers",
+    )
+    parser.add_argument(
         "--param_weight",
         type=float,
         default=1.0,
@@ -627,13 +651,12 @@ def main() -> None:
     vocab_size = len(Token)
     components = build_cad_model(
         vocab_size=vocab_size,
-        gt_dim=256,
-        d_model=256,
-        n_heads=4,
-        num_layers=4,
+        gt_dim=args.gt_dim,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        num_layers=args.num_layers,
         max_seq_len=args.max_seq_len,
-        hidden_dim=256,
-        err_dim=3,  # 3D error embedding (chamfer, centroid_dist, log_scale_ratio)
+        err_dim=ERR_EMBED_DIM,
         device=device,
     )
 
