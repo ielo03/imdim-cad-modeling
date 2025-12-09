@@ -270,6 +270,18 @@ def main() -> None:
         # Single-sample mode (original behavior)
         gt_points, cur_points, hist_tokens = load_sample_npz(sample_path)
 
+        # Load ground-truth next_tokens (if present) for comparison
+        gt_next_tokens = None
+        try:
+            data = np.load(sample_path)
+            if "next_tokens" in data.files:
+                next_tokens_np = data["next_tokens"].astype(np.int64)
+                if next_tokens_np.ndim == 0:
+                    next_tokens_np = next_tokens_np.reshape(1)
+                gt_next_tokens = next_tokens_np
+        except Exception:
+            gt_next_tokens = None
+
         next_token_id, next_params = predict_next_step(
             components, gt_points, cur_points, hist_tokens, device
         )
@@ -285,6 +297,21 @@ def main() -> None:
         print(f"Next token id   : {token_int}")
         print(f"Next token name : {token_name}")
         print(f"Next params [10]: {next_params.numpy().reshape(-1)}")
+
+        # Ground-truth next token(s), if available
+        if gt_next_tokens is not None:
+            gt_ids = gt_next_tokens.tolist()
+            print(f"GT next token ids   : {gt_ids}")
+            # Decode the first GT token name if possible
+            try:
+                gt_first = int(gt_ids[0])
+                gt_enum = Token(gt_first)
+                gt_name = gt_enum.name
+            except Exception:
+                gt_name = f"<unknown:{gt_ids[0]}>"
+            print(f"GT first token name : {gt_name}")
+        else:
+            print("GT next_tokens not found in sample.")
 
 
 if __name__ == "__main__":  # pragma: no cover
