@@ -405,6 +405,8 @@ def train_epoch(
     components.token_head.train()
 
     total_loss = 0.0
+    total_param_loss = 0.0
+    total_token_loss = 0.0
     num_batches = 0
     total_samples = 0
 
@@ -436,15 +438,22 @@ def train_epoch(
         batch_size = gt_points.shape[0]
         total_samples += batch_size
         total_loss += loss.item()
+        total_param_loss += param_loss.item()
+        total_token_loss += token_loss.item()
         num_batches += 1
 
     epoch_time = time.time() - epoch_start
     avg_loss = total_loss / max(num_batches, 1)
+    avg_param_loss = total_param_loss / max(num_batches, 1)
+    avg_token_loss = total_token_loss / max(num_batches, 1)
     avg_time_per_batch = epoch_time / max(num_batches, 1)
     avg_time_per_sample = epoch_time / max(total_samples, 1)
 
     print(
-        f"Epoch {epoch}: avg loss = {avg_loss:.6f}, "
+        f"Epoch {epoch}: "
+        f"avg total loss = {avg_loss:.6f}, "
+        f"avg param loss = {avg_param_loss:.6f}, "
+        f"avg token loss = {avg_token_loss:.6f}, "
         f"time = {epoch_time:.4f}s, "
         f"{avg_time_per_batch:.4f}s/batch, "
         f"{avg_time_per_sample:.6f}s/sample"
@@ -471,6 +480,8 @@ def eval_epoch(
     components.token_head.eval()
 
     total_loss = 0.0
+    total_param_loss = 0.0
+    total_token_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -489,10 +500,17 @@ def eval_epoch(
             loss = param_loss + token_loss
 
             total_loss += loss.item()
+            total_param_loss += param_loss.item()
+            total_token_loss += token_loss.item()
             num_batches += 1
 
     avg_loss = total_loss / max(num_batches, 1)
-    print(f"Epoch {epoch}: VAL avg loss = {avg_loss:.6f}")
+    avg_param_loss = total_param_loss / max(num_batches, 1)
+    avg_token_loss = total_token_loss / max(num_batches, 1)
+    print(
+        f"Epoch {epoch}: VAL avg total loss = {avg_loss:.6f}, "
+        f"param = {avg_param_loss:.6f}, token = {avg_token_loss:.6f}"
+    )
     return avg_loss
 
 
