@@ -116,16 +116,22 @@ def compute_error_embedding(
         )
 
     # 1) Chamfer distance (no grad through geometry backend)
+    # chamfer_distance expects rank-2 [N,3] tensors, so compute it per batch element.
     with torch.no_grad():
-        chamf = chamfer_distance(cur_points, gt_points)  # [B] or scalar
+        chamf_list = []
+        for b in range(B):
+            # Each call takes [N_b, 3] and [M_b, 3]
+            chamf_b = chamfer_distance(cur_points[b], gt_points[b])
+            if not isinstance(chamf_b, torch.Tensor):
+                chamf_b = torch.as_tensor(
+                    chamf_b,
+                    device=gt_points.device,
+                    dtype=gt_points.dtype,
+                )
+            # Ensure scalar tensor, then collect
+            chamf_list.append(chamf_b.reshape(1))
 
-    if not isinstance(chamf, torch.Tensor):
-        chamf = torch.as_tensor(chamf, device=gt_points.device, dtype=gt_points.dtype)
-
-    if chamf.dim() == 0:
-        chamf = chamf.expand(B)
-    elif chamf.shape[0] != B:
-        raise ValueError(f"Chamfer output batch size mismatch: {chamf.shape} vs B={B}")
+        chamf = torch.cat(chamf_list, dim=0)  # [B]
 
     # 2) Centroid distance
     centroid_gt = gt_points.mean(dim=1)   # [B, 3]

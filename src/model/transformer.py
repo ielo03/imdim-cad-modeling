@@ -76,7 +76,7 @@ class CADTransformer(nn.Module):
             nhead=n_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=False,  # [T, B, D]
+            batch_first=True,  # [B, T, D]
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -150,11 +150,8 @@ class CADTransformer(nn.Module):
 
         x = self.dropout(x)
 
-        # TransformerEncoder expects [T, B, D]
-        x_tbd = x.transpose(0, 1)  # [T, B, D]
-        h_tbd = self.encoder(x_tbd)  # [T, B, D]
-        hidden_states = h_tbd.transpose(0, 1)  # [B, T, D]
-
+        # With batch_first=True, TransformerEncoder expects [B, T, D]
+        hidden_states = self.encoder(x)  # [B, T, d_model]
         return hidden_states
 
 

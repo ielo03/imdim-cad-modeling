@@ -33,6 +33,7 @@ import sys
 from pathlib import Path
 import argparse
 import random
+import time
 from typing import Dict, Any
 
 import numpy as np
@@ -80,16 +81,16 @@ class NPZCADDataset(Dataset):
         super().__init__()
         self.root = Path(root_dir)
 
-        # Either a single root/sample.npz, or many root/sample_XXXXX.npz
+        # Either a single root/sample.npz, or many root/XXXXX.npz
         single_path = self.root / "sample.npz"
         if single_path.exists():
             self.sample_paths = [single_path]
         else:
-            # New flat layout: dataset/train/sample_XXXXX.npz, dataset/val/sample_XXXXX.npz
-            self.sample_paths = sorted(self.root.glob("sample_*.npz"))
+            # New flat layout: dataset/train/XXXXX.npz, dataset/val/pyXXXXX.npz
+            self.sample_paths = sorted(self.root.glob("*.npz"))
 
         if not self.sample_paths:
-            raise RuntimeError(f"No sample.npz or sample_*.npz files found under {self.root}")
+            raise RuntimeError(f"No sample.npz or *.npz files found under {self.root}")
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -138,9 +139,125 @@ class NPZCADDataset(Dataset):
         }
 
 
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Collate & point-cloud resampling for batching
+# ---------------------------------------------------------------------------
+
+
+def _resample_points(points: torch.Tensor, target_n: int) -> torch.Tensor:
+    """Resample a point cloud to a fixed number of points.
+
+    This makes it possible to batch samples with different N by enforcing
+    a common size [target_n, 3] for all `gt_points` and `cur_points`.
+
+    Strategy:
+        - If N == target_n: return as-is.
+        - If N > target_n: random downsample without replacement (if possible).
+        - If 0 < N < target_n: sample with replacement until target_n.
+        - If N == 0: return all zeros.
+    """
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape [N, 3], got {tuple(points.shape)}")
+
+    N = points.shape[0]
+    device = points.device
+    dtype = points.dtype
+
+    if N == 0:
+        # No points: just return zeros as a placeholder cloud.
+        return torch.zeros(target_n, 3, device=device, dtype=dtype)
+
+    if N == target_n:
+        return points
+
+    if N > target_n:
+        # Downsample without replacement if possible.
+        if N >= target_n:
+            idx = torch.randperm(N, device=device)[:target_n]
+        else:
+            # Fallback, though logically N > target_n here, so we shouldn't hit this.
+            idx = torch.randint(0, N, (target_n,), device=device)
+        return points[idx]
+
+    # 0 < N < target_n: sample with replacement.
+    idx = torch.randint(0, N, (target_n,), device=device)
+    return points[idx]
+
+
+def cad_collate(
+    batch,
+    max_gt_points: int = 2048,
+    max_cur_points: int = 2048,
+):
+    """Custom collate_fn that makes shapes batchable.
+
+    - Resamples `gt_points` and `cur_points` in each sample to fixed
+      sizes [max_gt_points, 3] and [max_cur_points, 3].
+    - Stacks tokens and params assuming they already share a common
+      sequence length T across the batch.
+
+    If token/param sequence lengths differ across samples, this will
+    raise a ValueError so we don't silently mis-align supervision.
+    """
+
+    gt_points_list = []
+    cur_points_list = []
+    gt_tokens_list = []
+    gt_params_list = []
+
+    for item in batch:
+        gp = item["gt_points"]  # [N,3]
+        cp = item["cur_points"]  # [M,3]
+        gt_tokens = item["gt_tokens"]  # [T]
+        gt_params = item["gt_params"]  # [T,10]
+
+        # Ensure tensors are on CPU here; they will be moved to device later.
+        if gp.device.type != "cpu":
+            gp = gp.cpu()
+        if cp.device.type != "cpu":
+            cp = cp.cpu()
+
+        gp_fixed = _resample_points(gp, max_gt_points)   # [max_gt_points, 3]
+        cp_fixed = _resample_points(cp, max_cur_points)  # [max_cur_points, 3]
+
+        gt_points_list.append(gp_fixed)
+        cur_points_list.append(cp_fixed)
+        gt_tokens_list.append(gt_tokens)
+        gt_params_list.append(gt_params)
+
+    # Stack point clouds: [B, N_fixed, 3]
+    gt_points = torch.stack(gt_points_list, dim=0)
+    cur_points = torch.stack(cur_points_list, dim=0)
+
+    # Check and stack tokens/params. We assume equal T across the batch.
+    T = gt_tokens_list[0].shape[0]
+    for t in gt_tokens_list:
+        if t.shape[0] != T:
+            raise ValueError(
+                "Variable token sequence lengths in batch; "
+                "add padding + masking logic before increasing batch_size."
+            )
+    for p in gt_params_list:
+        if p.shape[0] != T:
+            raise ValueError(
+                "gt_params length does not match gt_tokens length in batch."
+            )
+
+    gt_tokens = torch.stack(gt_tokens_list, dim=0)   # [B, T]
+    gt_params = torch.stack(gt_params_list, dim=0)   # [B, T, 10]
+
+    return {
+        "gt_points": gt_points,
+        "cur_points": cur_points,
+        "gt_tokens": gt_tokens,
+        "gt_params": gt_params,
+    }
 
 
 def build_dataloader(
@@ -149,12 +266,24 @@ def build_dataloader(
 ) -> DataLoader:
     """Build a DataLoader over NPZCADDataset.
 
-    Note: if samples have varying N/T, use batch_size=1 or add a custom
-    collate_fn to pad sequences.
+    We enable batching over samples with different point counts by
+    resampling `gt_points` and `cur_points` inside a custom collate_fn
+    (`cad_collate`).
+
+    Assumptions:
+        - All samples in a batch share the same token/param sequence
+          length T. If they do not, cad_collate will raise an error
+          so we don't silently mis-align supervision.
     """
 
     dataset = NPZCADDataset(data_root)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=cad_collate,
+    )
 
 
 def compute_param_mse_loss(
@@ -277,8 +406,11 @@ def train_epoch(
 
     total_loss = 0.0
     num_batches = 0
+    total_samples = 0
 
-    for batch in dataloader:
+    epoch_start = time.time()
+
+    for batch_idx, batch in enumerate(dataloader, start=1):
         gt_points = batch["gt_points"].to(device)   # [B, N, 3]
         cur_points = batch["cur_points"].to(device) # [B, M, 3] (unused for now)
         gt_tokens = batch["gt_tokens"].to(device)   # [B, T]
@@ -301,11 +433,23 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
+        batch_size = gt_points.shape[0]
+        total_samples += batch_size
         total_loss += loss.item()
         num_batches += 1
 
+    epoch_time = time.time() - epoch_start
     avg_loss = total_loss / max(num_batches, 1)
-    print(f"Epoch {epoch}: avg loss = {avg_loss:.6f}")
+    avg_time_per_batch = epoch_time / max(num_batches, 1)
+    avg_time_per_sample = epoch_time / max(total_samples, 1)
+
+    print(
+        f"Epoch {epoch}: avg loss = {avg_loss:.6f}, "
+        f"time = {epoch_time:.4f}s, "
+        f"{avg_time_per_batch:.4f}s/batch, "
+        f"{avg_time_per_sample:.6f}s/sample"
+    )
+
     return avg_loss
 
 
