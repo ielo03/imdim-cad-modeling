@@ -179,7 +179,7 @@ class ShapeState:
         p = self._require_params(Token.ADD_BOX, params, expected_len=10)
         cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         sx, sy, sz = p0, p1, p2
-        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
+        role = Role.POSITIVE if sign_raw < 0.5 else Role.NEGATIVE
         prim = Primitive(
             kind="box",
             role=role,
@@ -195,7 +195,7 @@ class ShapeState:
         p = self._require_params(Token.ADD_SPHERE, params, expected_len=10)
         cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         r = p0
-        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
+        role = Role.POSITIVE if sign_raw < 0.5 else Role.NEGATIVE
         prim = Primitive(
             kind="sphere",
             role=role,
@@ -211,7 +211,7 @@ class ShapeState:
         p = self._require_params(Token.ADD_CYLINDER, params, expected_len=10)
         cx, cy, cz, p0, p1, p2, rx, ry, rz, sign_raw = p[:10]
         r, h = p0, p1
-        role = Role.NEGATIVE if sign_raw < 0.5 else Role.POSITIVE
+        role = Role.POSITIVE if sign_raw < 0.5 else Role.NEGATIVE
         prim = Primitive(
             kind="cylinder",
             role=role,
